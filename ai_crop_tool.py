@@ -10,8 +10,10 @@ from core import (
     build_crop_around_subject,
     compute_iou,
     get_focus_score,
+    parse_ratio,
     run_florence_od_detection,
     run_florence_phrase_detection,
+    shift_box_to_fit,
     union_boxes,
 )
 from models import CropBox, Detection, SportProfile, BoundingBox
@@ -270,6 +272,146 @@ class AICropTool:
     def _cache_key(self, image_path, prompts: list[str], mode: str) -> tuple:
         return (str(image_path), tuple(prompts), mode)
 
+    def _find_cached_cull_entry(self, image_path: Path, config: dict) -> dict | None:
+        cache_entries = config.get("cached_cull_entries")
+        if not isinstance(cache_entries, dict):
+            return None
+        return cache_entries.get(image_path.name.lower())
+
+    def _bbox_from_cached_entry(self, image_path: Path, cache_entry: dict) -> BoundingBox | None:
+        chosen_id = cache_entry.get("chosen_id")
+        if chosen_id is None:
+            self.app.log(f"AI Crop cache: missing chosen_id for {image_path.name}; falling back to detection.")
+            return None
+
+        try:
+            chosen_id = int(chosen_id)
+        except Exception:
+            self.app.log(f"AI Crop cache: invalid chosen_id for {image_path.name}; falling back to detection.")
+            return None
+
+        candidates = cache_entry.get("dance_candidates", [])
+        if not isinstance(candidates, list):
+            self.app.log(f"AI Crop cache: invalid dance_candidates for {image_path.name}; falling back to detection.")
+            return None
+
+        chosen = None
+        for d in candidates:
+            try:
+                if int(d.get("id", -1)) == chosen_id:
+                    chosen = d
+                    break
+            except Exception:
+                continue
+        if chosen is None:
+            self.app.log(
+                f"AI Crop cache: chosen_id={chosen_id} not found in dance_candidates for {image_path.name}; "
+                "falling back to detection."
+            )
+            return None
+
+        bbox = chosen.get("bbox")
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            self.app.log(f"AI Crop cache: invalid bbox for {image_path.name}; falling back to detection.")
+            return None
+
+        try:
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+        except Exception:
+            self.app.log(f"AI Crop cache: non-numeric bbox for {image_path.name}; falling back to detection.")
+            return None
+
+        if x2 <= x1 or y2 <= y1:
+            self.app.log(f"AI Crop cache: degenerate bbox for {image_path.name}; falling back to detection.")
+            return None
+
+        return BoundingBox(x1, y1, x2, y2)
+
+    def _is_bbox_near_edge(self, bbox: BoundingBox, img_w: int, img_h: int) -> bool:
+        edge_x = max(8, int(round(img_w * 0.04)))
+        edge_y = max(8, int(round(img_h * 0.04)))
+        return (
+            bbox.x1 <= edge_x
+            or bbox.y1 <= edge_y
+            or bbox.x2 >= (img_w - edge_x)
+            or bbox.y2 >= (img_h - edge_y)
+        )
+
+    def _tight_edge_crop(self, bbox: BoundingBox, img_w: int, img_h: int, config: dict) -> BoundingBox:
+        width = max(1, bbox.width)
+        height = max(1, bbox.height)
+
+        tight_w_margin = int(round(width * 0.06))
+        tight_bottom = int(round(height * 0.80))
+        tight_box = BoundingBox(
+            x1=max(0, bbox.x1 + tight_w_margin),
+            y1=max(0, bbox.y1),
+            x2=min(img_w, bbox.x2 - tight_w_margin),
+            y2=min(img_h, bbox.y1 + tight_bottom),
+        )
+        if tight_box.x2 <= tight_box.x1 or tight_box.y2 <= tight_box.y1:
+            tight_box = bbox
+
+        ratio_str = config["main_ratio"]
+        if parse_ratio(ratio_str) >= 1.0:
+            ratio_str = "4:5"
+
+        crop = build_crop_around_subject(
+            subject_box=tight_box,
+            img_w=img_w,
+            img_h=img_h,
+            ratio_str=ratio_str,
+            margin_pct=max(2.0, float(config["margin_buffer"]) * 0.4),
+        )
+
+        crop_w = crop.width
+        crop_h = crop.height
+        head_x = (bbox.x1 + bbox.x2) / 2.0
+        head_y = bbox.y1 + (height * 0.12)
+
+        target_x1 = int(round(head_x - (crop_w / 2.0)))
+        target_y1 = int(round(head_y - (crop_h / 3.0)))
+        target = BoundingBox(
+            x1=target_x1,
+            y1=target_y1,
+            x2=target_x1 + crop_w,
+            y2=target_y1 + crop_h,
+        )
+        return shift_box_to_fit(target, img_w, img_h)
+
+    def _cached_crop_for_pipeline(self, image_path: Path, config: dict) -> tuple[BoundingBox | None, str]:
+        cache_entries = config.get("cached_cull_entries")
+        if not isinstance(cache_entries, dict) or not cache_entries:
+            return None, "cache unavailable"
+
+        entry = self._find_cached_cull_entry(image_path, config)
+        if entry is None:
+            self.app.log(f"AI Crop cache: no cache entry for {image_path.name}; falling back to detection.")
+            return None, "cache miss"
+
+        bbox = self._bbox_from_cached_entry(image_path, entry)
+        if bbox is None:
+            return None, "cache invalid"
+
+        img_w = self.app.current_image.width
+        img_h = self.app.current_image.height
+        near_edge = self._is_bbox_near_edge(bbox, img_w, img_h)
+
+        if near_edge:
+            crop = self._tight_edge_crop(bbox, img_w, img_h, config)
+            self.app.log(f"AI Crop cache: {image_path.name} using edge-tight 3/4 crop mode.")
+            return crop, "cache edge-tight"
+
+        crop = build_crop_around_subject(
+            subject_box=bbox,
+            img_w=img_w,
+            img_h=img_h,
+            ratio_str=config["main_ratio"],
+            margin_pct=config["margin_buffer"],
+        )
+        self.app.log(f"AI Crop cache: {image_path.name} using cached full-body crop mode.")
+        return crop, "cache full-body"
+
     def _get_hybrid_detections_for_current_image(self, prompts: list[str]) -> list[Detection]:
         image_path = self.app.state.current_image_path
         if image_path is None or self.app.current_image is None:
@@ -328,6 +470,17 @@ class AICropTool:
 
         try:
             self.app.load_image(Path(image_path))
+
+            cached_crop, cached_reason = self._cached_crop_for_pipeline(Path(image_path), config)
+            if cached_crop is not None:
+                return {
+                    "path": Path(image_path),
+                    "detections": [],
+                    "hero": None,
+                    "support_ball": None,
+                    "crop": cached_crop,
+                    "hero_reason": cached_reason,
+                }
 
             prompts = config["prompts"]
             detection_mode = config["detection_mode"]

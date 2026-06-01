@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import shutil
 from pathlib import Path
 import tkinter as tk
@@ -33,6 +34,7 @@ class PipelineTool:
 
         self.cull_config: dict = {}
         self.crop_config: dict = {}
+        self.cached_cull_entries: dict[str, dict] = {}
 
         self.output_root: Path | None = None
         self.keepers_dir: Path | None = None
@@ -202,6 +204,41 @@ class PipelineTool:
             writer.writerow(["filename", "saved_crop", "hero_reason"])
             writer.writerows(self.crop_rows)
 
+    def _load_cached_cull_entries_by_filename(self, source_folder: Path) -> dict[str, dict]:
+        cache_path = source_folder / "VL_Debug" / "dance_cull_cache.json"
+        if not cache_path.exists():
+            self.app.log("Pipeline: dance cull cache not found; crop will use normal detection.")
+            return {}
+
+        try:
+            with cache_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            self.app.log(f"Pipeline: failed reading dance cull cache ({exc}); crop will use normal detection.")
+            return {}
+
+        entries = data.get("entries", {})
+        if not isinstance(entries, dict):
+            self.app.log("Pipeline: dance cull cache has invalid entries object; crop will use normal detection.")
+            return {}
+
+        by_name: dict[str, dict] = {}
+        for key, entry in entries.items():
+            if not isinstance(entry, dict):
+                continue
+            image_name = ""
+            image_path = entry.get("image_path")
+            if isinstance(image_path, str) and image_path.strip():
+                image_name = Path(image_path).name
+            if not image_name:
+                image_name = str(key).split("|", 1)[0]
+            if not image_name:
+                continue
+            by_name[image_name.lower()] = entry
+
+        self.app.log(f"Pipeline: loaded {len(by_name)} cached cull entries from {cache_path}.")
+        return by_name
+
     def run_full_trial(self):
         if self.is_running:
             self.app.log("Pipeline already running.")
@@ -226,6 +263,8 @@ class PipelineTool:
 
         self.cull_config = ai_cull.get_runtime_config()
         self.crop_config = ai_crop.get_runtime_config()
+        self.cached_cull_entries = self._load_cached_cull_entries_by_filename(source_folder)
+        self.crop_config["cached_cull_entries"] = self.cached_cull_entries
 
         self.output_root = source_folder / "Output"
         self.keepers_dir = self.output_root / "Keepers"
