@@ -55,7 +55,6 @@ class AICullTool:
         self.use_dance_vl_var = tk.BooleanVar(value=True)
         self.use_dance_vl_subject_picker_var = tk.BooleanVar(value=True)
         self.save_vl_debug_images_var = tk.BooleanVar(value=True)
-        self.show_dance_debug_preview_var = tk.BooleanVar(value=True)
 
         self.current_score = 0.0
         self.current_decision = "Reject"
@@ -192,15 +191,6 @@ class AICullTool:
             selectcolor="#444",
         ).pack(anchor="w")
 
-        tk.Checkbutton(
-            self.dance_frame,
-            text="Show 4-Panel Debug Preview",
-            variable=self.show_dance_debug_preview_var,
-            bg="#2a2a2a",
-            fg="white",
-            selectcolor="#444",
-        ).pack(anchor="w")
-
         tk.Button(self.panel, text="Rerun AI Cull", command=self.rerun).pack(fill="x", padx=10, pady=(10, 4))
         tk.Button(self.panel, text="Approve Keep/Maybe", command=self.approve).pack(fill="x", padx=10, pady=(0, 4))
 
@@ -285,7 +275,6 @@ class AICullTool:
             "use_dance_vl": bool(self.use_dance_vl_var.get()),
             "use_dance_vl_subject_picker": bool(self.use_dance_vl_subject_picker_var.get()),
             "save_vl_debug_images": bool(self.save_vl_debug_images_var.get()),
-            "show_dance_debug_preview": bool(self.show_dance_debug_preview_var.get()),
         }
 
     def _is_ball_label(self, label: str) -> bool:
@@ -632,91 +621,6 @@ class AICullTool:
         out.mkdir(parents=True, exist_ok=True)
         return out
 
-    def _load_rgb_image(self, image_path: Path) -> Image.Image:
-        with Image.open(image_path) as img:
-            return img.convert("RGB")
-
-    def _draw_florence_candidates_preview(self, image_path: Path, detections: list[Detection]) -> Image.Image:
-        img = self._load_rgb_image(image_path)
-        draw = ImageDraw.Draw(img)
-        font = ImageFont.load_default()
-
-        for det in detections:
-            bbox = det.bbox
-            color = "#33D6FF"
-            draw.rectangle([bbox.x1, bbox.y1, bbox.x2, bbox.y2], outline=color, width=4)
-
-            id_label = str(det.id)
-            try:
-                left, top, right, bottom = draw.textbbox((0, 0), id_label, font=font)
-                text_w = right - left
-                text_h = bottom - top
-            except Exception:
-                text_w = 14
-                text_h = 14
-
-            pad = 4
-            label_x = max(0, bbox.x1)
-            label_y = max(0, bbox.y1 - text_h - pad * 2)
-
-            draw.rectangle(
-                [label_x, label_y, label_x + text_w + pad * 2, label_y + text_h + pad * 2],
-                fill="black",
-                outline=color,
-                width=1,
-            )
-            draw.text((label_x + pad, label_y + pad), id_label, fill="white", font=font)
-
-            info = det.label
-            try:
-                left2, top2, right2, bottom2 = draw.textbbox((0, 0), info, font=font)
-                text_w2 = right2 - left2
-                text_h2 = bottom2 - top2
-            except Exception:
-                text_w2 = max(24, len(info) * 7)
-                text_h2 = 14
-
-            info_y = min(img.height - text_h2 - pad * 2, bbox.y1 + 8)
-            draw.rectangle(
-                [label_x, info_y, label_x + text_w2 + pad * 2, info_y + text_h2 + pad * 2],
-                fill="black",
-            )
-            draw.text((label_x + pad, info_y + pad), info, fill=color, font=font)
-
-        return img
-
-    def _draw_final_subject_preview(self, image_path: Path, chosen: Detection | None) -> Image.Image:
-        img = self._load_rgb_image(image_path)
-        if chosen is None:
-            return img
-
-        draw = ImageDraw.Draw(img)
-        font = ImageFont.load_default()
-        bbox = chosen.bbox
-        color = "#00FF66"
-        draw.rectangle([bbox.x1, bbox.y1, bbox.x2, bbox.y2], outline=color, width=5)
-
-        label = f"FINAL {chosen.id}"
-        try:
-            left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
-            text_w = right - left
-            text_h = bottom - top
-        except Exception:
-            text_w = max(40, len(label) * 7)
-            text_h = 14
-
-        pad = 4
-        label_x = max(0, bbox.x1)
-        label_y = max(0, bbox.y1 - text_h - pad * 2)
-        draw.rectangle(
-            [label_x, label_y, label_x + text_w + pad * 2, label_y + text_h + pad * 2],
-            fill="black",
-            outline=color,
-            width=1,
-        )
-        draw.text((label_x + pad, label_y + pad), label, fill=color, font=font)
-        return img
-
     def _draw_shaded_candidate_image(self, image_path: Path, detections: list[Detection]) -> tuple[Path, dict[int, str], dict[str, int]]:
         with Image.open(image_path) as img:
             base = img.convert("RGBA")
@@ -755,7 +659,7 @@ class AICullTool:
 
                 draw.rectangle(
                     [label_x, label_y, label_x + text_w + pad * 2, label_y + text_h + pad * 2],
-                    fill=(0, 0, 0, 220),
+                    fill=(0, 0, 0, 210),
                     outline=outline_rgba,
                     width=1,
                 )
@@ -1088,7 +992,6 @@ class AICullTool:
         self.current_vl_rubric = None
         self.current_vl_subject_reason = ""
         self.current_vl_debug_image_path = None
-        self.app.clear_debug_views()
 
         self._refresh_dynamic_sections()
 
@@ -1116,10 +1019,6 @@ class AICullTool:
 
             chosen = None
             chosen_reason = ""
-            original_preview = self._load_rgb_image(self.app.state.current_image_path)
-            florence_preview = self._draw_florence_candidates_preview(self.app.state.current_image_path, people)
-            vl_input_preview = None
-            final_preview = self._draw_final_subject_preview(self.app.state.current_image_path, None)
 
             if bool(runtime_config.get("use_dance_vl_subject_picker", False)) and people:
                 try:
@@ -1127,9 +1026,6 @@ class AICullTool:
                         self.app.state.current_image_path,
                         people,
                     )
-                    if self.current_vl_debug_image_path is not None:
-                        vl_input_preview = self.current_vl_debug_image_path
-                    final_preview = self._draw_final_subject_preview(self.app.state.current_image_path, chosen)
                     self.current_vl_subject_reason = chosen_reason
                     self.app.log(
                         f"AI Cull Dance VL subject picker: "
@@ -1151,17 +1047,6 @@ class AICullTool:
 
             self.app.set_manual_selected_ids(selected_ids)
             self.app.set_overlays(overlays)
-
-            if bool(runtime_config.get("show_dance_debug_preview", False)):
-                if vl_input_preview is None and self.current_vl_debug_image_path is not None:
-                    vl_input_preview = self.current_vl_debug_image_path
-
-                self.app.set_debug_views([
-                    ("Florence Candidates", florence_preview),
-                    ("VL Input", vl_input_preview),
-                    ("Final Subject", final_preview),
-                    ("Original", original_preview),
-                ])
 
             if bool(runtime_config.get("use_dance_vl", False)):
                 try:

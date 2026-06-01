@@ -122,6 +122,7 @@ class SportsToolkitApp:
             self.current_af_boxes = []
             self.ui.set_thumbnail_paths([])
             self.ui.clear_image()
+            self.ui.clear_debug_views()
             self._refresh_header_info()
             return
 
@@ -138,6 +139,7 @@ class SportsToolkitApp:
             self.current_af_boxes = []
             self.ui.set_thumbnail_paths([])
             self.ui.clear_image()
+            self.ui.clear_debug_views()
             self._refresh_header_info()
             self.log("No images found in selected input folder.")
             return
@@ -173,6 +175,7 @@ class SportsToolkitApp:
             self.current_image = None
             self.state.current_image_path = None
             self.ui.clear_image()
+            self.ui.clear_debug_views()
             self._refresh_header_info()
             return
 
@@ -183,6 +186,7 @@ class SportsToolkitApp:
         except Exception as exc:
             self.current_image = None
             self.ui.clear_image()
+            self.ui.clear_debug_views()
             self._refresh_header_info()
             self.log(f"Failed to load image: {path.name} ({exc})")
             return
@@ -192,6 +196,7 @@ class SportsToolkitApp:
         self.ui.set_manual_boxes([])
         self.ui.set_manual_selected_ids(set())
         self.ui.set_overlay_boxes([])
+        self.ui.clear_debug_views()
         self.ui.show_image(self.current_image)
         self.ui.highlight_thumbnail_index(self.state.current_index)
         self._refresh_header_info()
@@ -205,6 +210,12 @@ class SportsToolkitApp:
         tool = self.tools.get(self.state.active_tool_id)
         if tool and hasattr(tool, "on_image_changed"):
             tool.on_image_changed()
+
+    def set_debug_views(self, views):
+        self.ui.set_debug_views(views)
+
+    def clear_debug_views(self):
+        self.ui.clear_debug_views()
 
     def _refresh_header_info(self):
         input_name = self.state.input_folder.name if self.state.input_folder else "—"

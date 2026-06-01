@@ -156,6 +156,98 @@ class LMStudioClient:
             return "\n".join(p for p in parts if p)
         return json.dumps(content, indent=2)
 
+    def _extract_json_object(self, text: str) -> dict:
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("Empty response")
+
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = text[start:end + 1]
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+
+        raise ValueError("No valid JSON object found in response")
+
+    def dance_cull_rubric(
+        self,
+        model: str,
+        image_path: str | Path,
+        temperature: float = 0.1,
+        max_tokens: int = 700,
+    ) -> dict:
+        system_prompt = (
+            "You are a dance recital photo culling assistant.\n\n"
+            "Evaluate the image for keeper quality for dance recital delivery.\n\n"
+            "Return only valid JSON.\n"
+            "Do not use markdown.\n"
+            "Do not include code fences.\n"
+            "Do not include any text before or after the JSON.\n\n"
+            "Use exactly these keys:\n"
+            "- sharpness\n"
+            "- subject_visibility\n"
+            "- face_visibility\n"
+            "- full_body_visibility\n"
+            "- feet_visibility\n"
+            "- hands_visibility\n"
+            "- pose_quality\n"
+            "- moment_quality\n"
+            "- composition_quality\n"
+            "- background_distraction\n"
+            "- subject_separation\n"
+            "- overall_dance_keeper\n"
+            "- confidence\n"
+            "- summary\n\n"
+            "Allowed values:\n"
+            "- sharpness: strong, acceptable, soft, blurry\n"
+            "- subject_visibility: strong, good, partial, weak\n"
+            "- face_visibility: clear, partial, not_visible\n"
+            "- full_body_visibility: full, mostly_full, partial\n"
+            "- feet_visibility: fully_visible, partially_cropped, cropped_out\n"
+            "- hands_visibility: fully_visible, partially_cropped, cropped_out\n"
+            "- pose_quality: strong, good, awkward, unclear\n"
+            "- moment_quality: strong, good, average, weak\n"
+            "- composition_quality: strong, good, average, weak\n"
+            "- background_distraction: low, moderate, high\n"
+            "- subject_separation: good, somewhat_clear, poor\n"
+            "- overall_dance_keeper: keep, maybe, reject\n\n"
+            "Rules:\n"
+            "- confidence must be a number between 0 and 1\n"
+            "- summary must be one short sentence\n"
+            "- Be conservative and practical for dance recital photo delivery.\n"
+        )
+
+        user_prompt = (
+            "Evaluate this dance recital image using the required rubric.\n\n"
+            "Focus on:\n"
+            "- whether the dancer is sharp and clearly visible\n"
+            "- whether the face is visible\n"
+            "- whether the full body, feet, and hands are visible\n"
+            "- whether the pose is clean and aesthetically usable\n"
+            "- whether the moment is strong enough to keep\n"
+            "- whether the composition is clean enough for delivery\n\n"
+            "Return only valid JSON."
+        )
+
+        text = self.vision_chat_text(
+            model=model,
+            image_path=image_path,
+            user_prompt=user_prompt,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return self._extract_json_object(text)
+
     def test_connection(self) -> tuple[bool, str]:
         try:
             models = self.list_models()

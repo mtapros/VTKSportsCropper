@@ -5,7 +5,7 @@ from pathlib import Path
 from tkinter import filedialog, simpledialog
 from tkinter.scrolledtext import ScrolledText
 
-from PIL import ImageTk
+from PIL import Image, ImageTk
 
 
 class MainWindow:
@@ -24,6 +24,9 @@ class MainWindow:
         self.manual_boxes = []
         self.manual_selected_ids = set()
         self.manual_hitboxes = []
+
+        self.debug_views = []
+        self.debug_tk_images = []
 
         self.module_title_var = tk.StringVar(value="AI Crop Tool")
         self.module_subtitle_var = tk.StringVar(value="Automated subject-driven crop recommendations")
@@ -265,6 +268,7 @@ class MainWindow:
             "Manual Crop Tool": "Manual subject selection and crop building",
             "AI Cull Tool": "AI-assisted image culling, ranking, and filtering",
             "Full Trial Pipeline": "Automated cull-to-crop batch run with live visual progress",
+            "LM Studio Test": "LM Studio local model test and vision prompt debugging",
         }
 
         banner_colors = {
@@ -272,6 +276,7 @@ class MainWindow:
             "Manual Crop Tool": ("#6a3f00", "#ffe7c2"),
             "AI Cull Tool": ("#3f2a56", "#eadbff"),
             "Full Trial Pipeline": ("#1f5c42", "#d8ffef"),
+            "LM Studio Test": ("#3f2a56", "#eadbff"),
         }
 
         subtitle = subtitles.get(display_name, "")
@@ -326,6 +331,8 @@ class MainWindow:
         self.manual_boxes = []
         self.manual_selected_ids = set()
         self.manual_hitboxes = []
+        self.debug_views = []
+        self.debug_tk_images = []
         self.canvas.delete("all")
 
     def show_image(self, pil_image):
@@ -334,17 +341,100 @@ class MainWindow:
 
     def set_overlay_boxes(self, boxes):
         self.overlay_boxes = boxes
-        self.redraw_canvas()
+        if not self.debug_views:
+            self.redraw_canvas()
 
     def set_manual_boxes(self, boxes):
         self.manual_boxes = boxes
-        self.redraw_canvas()
+        if not self.debug_views:
+            self.redraw_canvas()
 
     def set_manual_selected_ids(self, selected_ids):
         self.manual_selected_ids = set(selected_ids)
+        if not self.debug_views:
+            self.redraw_canvas()
+
+    def set_debug_views(self, views):
+        self.debug_views = list(views or [])
         self.redraw_canvas()
 
+    def clear_debug_views(self):
+        self.debug_views = []
+        self.debug_tk_images = []
+        self.redraw_canvas()
+
+    def _load_debug_image(self, value):
+        if value is None:
+            return None
+        if hasattr(value, "copy") and hasattr(value, "size"):
+            return value
+        try:
+            path = Path(value)
+            if path.exists():
+                return Image.open(path).convert("RGB")
+        except Exception:
+            return None
+        return None
+
+    def _draw_debug_grid(self):
+        self.canvas.delete("all")
+        self.manual_hitboxes = []
+        self.debug_tk_images = []
+
+        cw = max(100, self.canvas.winfo_width())
+        ch = max(100, self.canvas.winfo_height())
+
+        pad = 10
+        header_h = 26
+        cell_w = max(100, (cw - pad * 3) // 2)
+        cell_h = max(100, (ch - pad * 3) // 2)
+
+        panels = list(self.debug_views[:4])
+        while len(panels) < 4:
+            panels.append(("Empty", None))
+
+        for idx, (title, content) in enumerate(panels):
+            row = idx // 2
+            col = idx % 2
+
+            x = pad + col * (cell_w + pad)
+            y = pad + row * (cell_h + pad)
+
+            self.canvas.create_rectangle(x, y, x + cell_w, y + cell_h, outline="#555555", width=1)
+            self.canvas.create_rectangle(x, y, x + cell_w, y + header_h, fill="#202020", outline="#555555", width=1)
+            self.canvas.create_text(x + 8, y + header_h / 2, text=title, fill="white", anchor="w", font=("Arial", 10, "bold"))
+
+            pil = self._load_debug_image(content)
+            if pil is None:
+                self.canvas.create_text(
+                    x + cell_w / 2,
+                    y + cell_h / 2,
+                    text="No preview",
+                    fill="#AAAAAA",
+                    font=("Arial", 12),
+                )
+                continue
+
+            avail_w = cell_w - 12
+            avail_h = cell_h - header_h - 12
+            iw, ih = pil.size
+            scale = min(avail_w / iw, avail_h / ih)
+            new_w = max(1, int(iw * scale))
+            new_h = max(1, int(ih * scale))
+
+            resized = pil.resize((new_w, new_h))
+            tk_img = ImageTk.PhotoImage(resized)
+            self.debug_tk_images.append(tk_img)
+
+            img_x = x + (cell_w - new_w) // 2
+            img_y = y + header_h + (avail_h - new_h) // 2
+            self.canvas.create_image(img_x, img_y, image=tk_img, anchor="nw")
+
     def redraw_canvas(self):
+        if self.debug_views:
+            self._draw_debug_grid()
+            return
+
         self.canvas.delete("all")
         self.manual_hitboxes = []
 
