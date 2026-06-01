@@ -1,0 +1,82 @@
+{
+  "Generic Sport": {
+    "prompts": [
+      "person",
+      "ball",
+      "",
+      ""
+    ],
+    "focus_min": 0.0,
+    "focus_relative": 0.0,
+    "edge_margin": 0,
+    "margin_buffer": 20.0,
+    "main_ratio": "4:5",
+    "auto_rotate": true,
+    "join_descriptors": false,
+    "safe_ratios": {
+      "2:3": true,
+      "5:7": true,
+      "1:1": false
+    }
+  },
+  "Soccer": {
+    "prompts": [
+      "player",
+      "soccer ball",
+      "goalkeeper",
+      "goal"
+    ],
+    "focus_min": 5.0,
+    "focus_relative": 60.0,
+    "edge_margin": 10,
+    "margin_buffer": 12.0,
+    "main_ratio": "4:5",
+    "auto_rotate": true,
+    "join_descriptors": true,
+    "safe_ratios": {
+      "2:3": true,
+      "5:7": true,
+      "1:1": false
+    }
+  },
+  "Football": {
+    "prompts": [
+      "person",
+      "ball",
+      "",
+      ""
+    ],
+    "focus_min": 0.0,
+    "focus_relative": 0.0,
+    "edge_margin": 0,
+    "margin_buffer": 20.0,
+    "main_ratio": "4:5",
+    "auto_rotate": true,
+    "join_descriptors": false,
+    "safe_ratios": {
+      "2:3": true,
+      "5:7": true,
+      "1:1": false
+    }
+  },
+  "Dance": {
+    "prompts": [
+      "face",
+      "person",
+      "dancer",
+      ""
+    ],
+    "focus_min": 0.0,
+    "focus_relative": 0.0,
+    "edge_margin": 0,
+    "margin_buffer": 5.0,
+    "main_ratio": "4:5",
+    "auto_rotate": false,
+    "join_descriptors": false,
+    "safe_ratios": {
+      "2:3": true,
+      "5:7": true,
+      "1:1": false
+    }
+  }
+}
