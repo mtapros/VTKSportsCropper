@@ -549,7 +549,7 @@ class AICullTool:
             debug_dir = self._dance_debug_dir(image_path)
             log_path = debug_dir / "manual_review.jsonl"
             entry = {
-                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "image_path": str(image_path),
                 **context,
             }
@@ -1564,7 +1564,7 @@ class AICullTool:
         # For the pipeline path we use a simple approach: load the image to get dims.
         crop_center_penalty = 0.0
         chosen_id = cached.get("chosen_id") if cached else None
-        if chosen_id is not None and cached:
+        if chosen_id is not None:
             candidate_dicts = cached.get("dance_candidates", [])
             chosen_det = next(
                 (self._det_from_dict(d) for d in candidate_dicts if d["id"] == chosen_id),
@@ -1588,7 +1588,7 @@ class AICullTool:
             "cull_score": result["score"],
             "cull_decision": result["decision"],
             "crop_center_penalty": crop_center_penalty,
-            "vl_mismatch": False,
+            "vl_mismatch": self.current_vl_mismatch,
         }
         if cached:
             cache_entry = {**cached, **cache_entry}
