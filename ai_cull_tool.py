@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import shutil
-import tempfile
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -636,98 +635,191 @@ class AICullTool:
         with Image.open(image_path) as img:
             return img.convert("RGB")
 
+    def _font(self, size: int = 18):
+        try:
+            return ImageFont.truetype("arial.ttf", size)
+        except Exception:
+            try:
+                return ImageFont.truetype("DejaVuSans-Bold.ttf", size)
+            except Exception:
+                return ImageFont.load_default()
+
+    def _text_bbox(self, draw: ImageDraw.ImageDraw, text: str, font):
+        try:
+            return draw.textbbox((0, 0), text, font=font)
+        except Exception:
+            width = max(20, int(len(text) * 9))
+            height = 18
+            return (0, 0, width, height)
+
+    def _draw_badge(
+        self,
+        draw: ImageDraw.ImageDraw,
+        x: int,
+        y: int,
+        text: str,
+        fill=(0, 0, 0, 220),
+        outline=(255, 255, 255, 255),
+        text_fill=(255, 255, 255, 255),
+        font=None,
+        pad_x: int = 8,
+        pad_y: int = 5,
+    ):
+        font = font or self._font(18)
+        left, top, right, bottom = self._text_bbox(draw, text, font)
+        text_w = right - left
+        text_h = bottom - top
+        box = [x, y, x + text_w + pad_x * 2, y + text_h + pad_y * 2]
+        draw.rounded_rectangle(box, radius=8, fill=fill, outline=outline, width=2)
+        draw.text((x + pad_x, y + pad_y), text, fill=text_fill, font=font)
+        return box
+
+    def _clamp_label_position(self, img_w: int, img_h: int, x: int, y: int, w: int, h: int) -> tuple[int, int]:
+        x = max(4, min(x, img_w - w - 4))
+        y = max(4, min(y, img_h - h - 4))
+        return x, y
+
     def _draw_florence_candidates_preview(self, image_path: Path, detections: list[Detection]) -> Image.Image:
         img = self._load_rgb_image(image_path)
-        draw = ImageDraw.Draw(img)
-        font = ImageFont.load_default()
+        draw = ImageDraw.Draw(img, "RGBA")
+        font_id = self._font(24)
+        font_label = self._font(18)
+
+        line_width = max(5, int(max(img.size) * 0.006))
 
         for det in detections:
             bbox = det.bbox
             color = "#33D6FF"
-            draw.rectangle([bbox.x1, bbox.y1, bbox.x2, bbox.y2], outline=color, width=4)
+            color_rgba = self._hex_to_rgba(color, 255)
+            fill_rgba = self._hex_to_rgba(color, 45)
 
-            id_label = str(det.id)
-            try:
-                left, top, right, bottom = draw.textbbox((0, 0), id_label, font=font)
-                text_w = right - left
-                text_h = bottom - top
-            except Exception:
-                text_w = 14
-                text_h = 14
+            draw.rectangle([bbox.x1, bbox.y1, bbox.x2, bbox.y2], outline=color_rgba, width=line_width)
+            draw.rectangle([bbox.x1, bbox.y1, bbox.x2, bbox.y2], fill=fill_rgba)
 
-            pad = 4
-            label_x = max(0, bbox.x1)
-            label_y = max(0, bbox.y1 - text_h - pad * 2)
-
-            draw.rectangle(
-                [label_x, label_y, label_x + text_w + pad * 2, label_y + text_h + pad * 2],
-                fill="black",
-                outline=color,
-                width=1,
+            id_text = f"ID {det.id}"
+            id_box_w = self._text_bbox(draw, id_text, font_id)[2] + 16
+            id_box_h = self._text_bbox(draw, id_text, font_id)[3] + 10
+            id_x, id_y = self._clamp_label_position(
+                img.width,
+                img.height,
+                bbox.x1 + 6,
+                bbox.y1 + 6,
+                id_box_w,
+                id_box_h,
             )
-            draw.text((label_x + pad, label_y + pad), id_label, fill="white", font=font)
-
-            info = det.label
-            try:
-                left2, top2, right2, bottom2 = draw.textbbox((0, 0), info, font=font)
-                text_w2 = right2 - left2
-                text_h2 = bottom2 - top2
-            except Exception:
-                text_w2 = max(24, len(info) * 7)
-                text_h2 = 14
-
-            info_y = min(img.height - text_h2 - pad * 2, bbox.y1 + 8)
-            draw.rectangle(
-                [label_x, info_y, label_x + text_w2 + pad * 2, info_y + text_h2 + pad * 2],
-                fill="black",
+            self._draw_badge(
+                draw,
+                id_x,
+                id_y,
+                id_text,
+                fill=(0, 0, 0, 225),
+                outline=color_rgba,
+                text_fill=(255, 255, 255, 255),
+                font=font_id,
+                pad_x=8,
+                pad_y=4,
             )
-            draw.text((label_x + pad, info_y + pad), info, fill=color, font=font)
+
+            label_text = str(det.label).strip() or "candidate"
+            label_box_w = self._text_bbox(draw, label_text, font_label)[2] + 16
+            label_box_h = self._text_bbox(draw, label_text, font_label)[3] + 10
+            label_x, label_y = self._clamp_label_position(
+                img.width,
+                img.height,
+                bbox.x1 + 6,
+                bbox.y1 + 42,
+                label_box_w,
+                label_box_h,
+            )
+            self._draw_badge(
+                draw,
+                label_x,
+                label_y,
+                label_text,
+                fill=(0, 0, 0, 215),
+                outline=color_rgba,
+                text_fill=color_rgba,
+                font=font_label,
+                pad_x=8,
+                pad_y=4,
+            )
 
         return img
 
     def _draw_final_subject_preview(self, image_path: Path, chosen: Detection | None) -> Image.Image:
         img = self._load_rgb_image(image_path)
+        draw = ImageDraw.Draw(img, "RGBA")
+
         if chosen is None:
-            return img
-
-        draw = ImageDraw.Draw(img)
-        font = ImageFont.load_default()
-        bbox = chosen.bbox
-        color = "#00FF66"
-        draw.rectangle([bbox.x1, bbox.y1, bbox.x2, bbox.y2], outline=color, width=5)
-
-        label = f"FINAL {chosen.id}"
-        try:
-            left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
+            font = self._font(24)
+            text = "NO FINAL PICK"
+            left, top, right, bottom = self._text_bbox(draw, text, font)
             text_w = right - left
             text_h = bottom - top
-        except Exception:
-            text_w = max(40, len(label) * 7)
-            text_h = 14
+            x = max(12, (img.width - text_w - 24) // 2)
+            y = 12
+            self._draw_badge(
+                draw,
+                x,
+                y,
+                text,
+                fill=(0, 0, 0, 225),
+                outline=(255, 80, 80, 255),
+                text_fill=(255, 220, 220, 255),
+                font=font,
+                pad_x=12,
+                pad_y=8,
+            )
+            return img
 
-        pad = 4
-        label_x = max(0, bbox.x1)
-        label_y = max(0, bbox.y1 - text_h - pad * 2)
-        draw.rectangle(
-            [label_x, label_y, label_x + text_w + pad * 2, label_y + text_h + pad * 2],
-            fill="black",
-            outline=color,
-            width=1,
+        bbox = chosen.bbox
+        color = "#00FF66"
+        color_rgba = self._hex_to_rgba(color, 255)
+        fill_rgba = self._hex_to_rgba(color, 40)
+
+        thick = max(7, int(max(img.size) * 0.008))
+        draw.rectangle([bbox.x1, bbox.y1, bbox.x2, bbox.y2], fill=fill_rgba)
+        draw.rectangle([bbox.x1, bbox.y1, bbox.x2, bbox.y2], outline=color_rgba, width=thick)
+
+        font = self._font(28)
+        text = f"FINAL PICK • ID {chosen.id}"
+        box_w = self._text_bbox(draw, text, font)[2] + 22
+        box_h = self._text_bbox(draw, text, font)[3] + 14
+        x, y = self._clamp_label_position(
+            img.width,
+            img.height,
+            bbox.x1 + 10,
+            bbox.y1 + 10,
+            box_w,
+            box_h,
         )
-        draw.text((label_x + pad, label_y + pad), label, fill=color, font=font)
+        self._draw_badge(
+            draw,
+            x,
+            y,
+            text,
+            fill=(0, 0, 0, 235),
+            outline=color_rgba,
+            text_fill=(255, 255, 255, 255),
+            font=font,
+            pad_x=11,
+            pad_y=7,
+        )
+
         return img
 
     def _draw_shaded_candidate_image(self, image_path: Path, detections: list[Detection]) -> tuple[Path, dict[int, str], dict[str, int]]:
         with Image.open(image_path) as img:
             base = img.convert("RGBA")
             overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
-            draw = ImageDraw.Draw(overlay)
-            font = ImageFont.load_default()
+            draw = ImageDraw.Draw(overlay, "RGBA")
+            font_main = self._font(24)
+            font_sub = self._font(18)
 
             det_to_color: dict[int, str] = {}
             color_to_det: dict[str, int] = {}
 
-            line_width = max(3, int(max(base.size) * 0.004))
+            line_width = max(6, int(max(base.size) * 0.007))
 
             for idx, det in enumerate(detections):
                 color_name, color_hex = self.DANCE_PICK_COLORS[idx % len(self.DANCE_PICK_COLORS)]
@@ -735,31 +827,60 @@ class AICullTool:
                 color_to_det[color_name] = det.id
 
                 bbox = det.bbox
-                fill_rgba = self._hex_to_rgba(color_hex, 70)
+                fill_rgba = self._hex_to_rgba(color_hex, 90)
                 outline_rgba = self._hex_to_rgba(color_hex, 255)
 
-                draw.rectangle([bbox.x1, bbox.y1, bbox.x2, bbox.y2], fill=fill_rgba, outline=outline_rgba, width=line_width)
+                draw.rectangle([bbox.x1, bbox.y1, bbox.x2, bbox.y2], fill=fill_rgba)
+                draw.rectangle([bbox.x1, bbox.y1, bbox.x2, bbox.y2], outline=outline_rgba, width=line_width)
 
-                label = f"{det.id} / {color_name}"
-                try:
-                    left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
-                    text_w = right - left
-                    text_h = bottom - top
-                except Exception:
-                    text_w = max(40, len(label) * 7)
-                    text_h = 14
+                main_text = f"ID {det.id}"
+                sub_text = color_name.upper()
 
-                pad = 5
-                label_x = max(0, bbox.x1)
-                label_y = max(0, bbox.y1 - text_h - pad * 2)
-
-                draw.rectangle(
-                    [label_x, label_y, label_x + text_w + pad * 2, label_y + text_h + pad * 2],
-                    fill=(0, 0, 0, 220),
-                    outline=outline_rgba,
-                    width=1,
+                main_box_w = self._text_bbox(draw, main_text, font_main)[2] + 18
+                main_box_h = self._text_bbox(draw, main_text, font_main)[3] + 10
+                main_x, main_y = self._clamp_label_position(
+                    base.width,
+                    base.height,
+                    bbox.x1 + 8,
+                    bbox.y1 + 8,
+                    main_box_w,
+                    main_box_h,
                 )
-                draw.text((label_x + pad, label_y + pad), label, fill=(255, 255, 255, 255), font=font)
+                self._draw_badge(
+                    draw,
+                    main_x,
+                    main_y,
+                    main_text,
+                    fill=(0, 0, 0, 230),
+                    outline=outline_rgba,
+                    text_fill=(255, 255, 255, 255),
+                    font=font_main,
+                    pad_x=9,
+                    pad_y=5,
+                )
+
+                sub_box_w = self._text_bbox(draw, sub_text, font_sub)[2] + 16
+                sub_box_h = self._text_bbox(draw, sub_text, font_sub)[3] + 10
+                sub_x, sub_y = self._clamp_label_position(
+                    base.width,
+                    base.height,
+                    bbox.x1 + 8,
+                    bbox.y1 + 48,
+                    sub_box_w,
+                    sub_box_h,
+                )
+                self._draw_badge(
+                    draw,
+                    sub_x,
+                    sub_y,
+                    sub_text,
+                    fill=(0, 0, 0, 215),
+                    outline=outline_rgba,
+                    text_fill=outline_rgba,
+                    font=font_sub,
+                    pad_x=8,
+                    pad_y=4,
+                )
 
             composed = Image.alpha_composite(base, overlay).convert("RGB")
 
@@ -819,7 +940,7 @@ class AICullTool:
 
         system_prompt = (
             "You are a dance recital photo subject selection assistant.\n\n"
-            "The image contains shaded colored candidate dancer regions.\n"
+            "The image contains shaded colored candidate dancer regions with prominent numeric ID labels.\n"
             "Choose the single candidate that best corresponds to the main dancer to evaluate for culling.\n\n"
             "Return only valid JSON.\n"
             "Do not use markdown.\n"
@@ -840,7 +961,7 @@ class AICullTool:
 
         user_prompt = (
             "Select the single highlighted candidate that is the clearest main dance subject for this frame.\n"
-            "Prioritize the colored region over the numeric label if they seem inconsistent.\n"
+            "Use the large numeric ID labels shown on the image.\n"
             "Return only valid JSON."
         )
 
