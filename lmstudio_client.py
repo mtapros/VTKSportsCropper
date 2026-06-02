@@ -218,7 +218,7 @@ class LMStudioClient:
         max_tokens: int = 700,
     ) -> dict:
         if not frames:
-            raise ValueError("select_burst_best_frame: no burst frames were provided.")
+            raise ValueError("select_burst_best_frame: no frames were provided.")
 
         if str(rubric_name).strip().lower() == "dance":
             emphasis = (

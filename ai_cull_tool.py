@@ -1747,6 +1747,8 @@ class AICullTool:
             winner_path_set: set[Path] = set()
             for item in winners:
                 winner_path = Path(item["path"])
+                if winner_path in winner_path_set:
+                    continue
                 winner_paths.append(winner_path)
                 winner_path_set.add(winner_path)
 
