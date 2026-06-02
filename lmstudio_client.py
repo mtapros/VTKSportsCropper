@@ -101,16 +101,35 @@ class LMStudioClient:
 
         return f"data:image/jpeg;base64,{encoded}"
 
-    def vision_chat_text(
+    def _image_content_item(
+        self,
+        image_path: str | Path,
+        max_side: int = 1024,
+        jpeg_quality: int = 90,
+    ) -> dict:
+        return {
+            "type": "image_url",
+            "image_url": {
+                "url": self._image_file_to_data_url(
+                    image_path,
+                    max_side=max_side,
+                    jpeg_quality=jpeg_quality,
+                ),
+            },
+        }
+
+    def vision_chat(
         self,
         model: str,
-        image_path: str | Path,
-        user_prompt: str,
+        user_content: str | list[dict],
         system_prompt: str = "You are a concise sports photography vision assistant.",
         temperature: float = 0.2,
         max_tokens: int = 512,
-    ) -> str:
-        data_url = self._image_file_to_data_url(image_path)
+    ) -> dict:
+        if isinstance(user_content, str):
+            content = [{"type": "text", "text": user_content}]
+        else:
+            content = user_content
 
         payload = {
             "model": model,
@@ -121,26 +140,37 @@ class LMStudioClient:
                 },
                 {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": user_prompt,
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": data_url,
-                            },
-                        },
-                    ],
+                    "content": content,
                 },
             ],
             "temperature": float(temperature),
             "max_tokens": int(max_tokens),
             "stream": False,
         }
+        return self._http_post_json("/chat/completions", payload)
 
-        data = self._http_post_json("/chat/completions", payload)
+    def vision_chat_text(
+        self,
+        model: str,
+        image_path: str | Path,
+        user_prompt: str,
+        system_prompt: str = "You are a concise sports photography vision assistant.",
+        temperature: float = 0.2,
+        max_tokens: int = 512,
+    ) -> str:
+        data = self.vision_chat(
+            model=model,
+            user_content=[
+                {
+                    "type": "text",
+                    "text": user_prompt,
+                },
+                self._image_content_item(image_path),
+            ],
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
         choices = data.get("choices", [])
         if not choices:
             return ""
@@ -178,6 +208,103 @@ class LMStudioClient:
                 return parsed
 
         raise ValueError("No valid JSON object found in response")
+
+    def select_burst_best_frame(
+        self,
+        model: str,
+        frames: list[dict],
+        rubric_name: str = "generic",
+        temperature: float = 0.1,
+        max_tokens: int = 700,
+    ) -> dict:
+        if not frames:
+            raise ValueError("No burst frames were provided.")
+
+        emphasis = (
+            "Prioritize the cleanest dance recital delivery frame: sharp subject, flattering pose, usable face angle, "
+            "full-body visibility, and uncropped feet/hands when possible."
+            if str(rubric_name).strip().lower() == "dance"
+            else "Prioritize the strongest keeper frame: sharpness, expression, moment, subject visibility, and clean composition."
+        )
+
+        system_prompt = (
+            "You are comparing near-duplicate frames from the same sports photo burst.\n"
+            "These images are already grouped heuristically as a burst, so do not regroup them.\n"
+            "Choose the single best keeper frame from the provided options.\n"
+            "Return only valid JSON.\n"
+            "Do not use markdown.\n"
+            "Do not include code fences.\n"
+            "Do not include any text before or after the JSON.\n\n"
+            "Use exactly these keys:\n"
+            "- best_frame\n"
+            "- alternates\n"
+            "- rejects\n"
+            "- confidence\n"
+            "- reason\n\n"
+            "Rules:\n"
+            "- best_frame must be one of the provided frame_id values.\n"
+            "- alternates must be an array of zero or more remaining frame_id values, ordered best to worst.\n"
+            "- rejects must be an array of zero or more remaining frame_id values.\n"
+            "- confidence must be a number between 0 and 1.\n"
+            "- reason must be one short sentence.\n"
+            "- Use the heuristic metadata only as a hint when the visual differences are subtle.\n"
+        )
+
+        content: list[dict] = [
+            {
+                "type": "text",
+                "text": (
+                    "Compare these burst frames and choose the best single keeper.\n"
+                    f"{emphasis}\n"
+                    "If there are strong backups, list them in alternates.\n"
+                    "If a frame is clearly weaker, list it in rejects.\n"
+                    "Return only valid JSON."
+                ),
+            }
+        ]
+
+        for frame in frames:
+            frame_id = str(frame.get("frame_id", "")).strip()
+            if not frame_id:
+                raise ValueError("Each burst frame must include a frame_id.")
+            filename = str(frame.get("filename", "")).strip() or Path(frame["image_path"]).name
+            decision = str(frame.get("decision", "")).strip() or "Unknown"
+            score = float(frame.get("heuristic_score", 0.0))
+            focus_score = float(frame.get("focus_score", 0.0))
+            face_visible = bool(frame.get("face_visible", False))
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        f"{frame_id}: {filename}\n"
+                        f"- heuristic_decision: {decision}\n"
+                        f"- heuristic_score: {score:.1f}\n"
+                        f"- focus_score: {focus_score:.1f}\n"
+                        f"- face_visible: {'yes' if face_visible else 'no'}"
+                    ),
+                }
+            )
+            content.append(self._image_content_item(frame["image_path"], max_side=768, jpeg_quality=85))
+
+        data = self.vision_chat(
+            model=model,
+            user_content=content,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        choices = data.get("choices", [])
+        if not choices:
+            raise ValueError("Empty burst selection response")
+        message = choices[0].get("message", {})
+        content = message.get("content", "")
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_parts.append(item.get("text", ""))
+            content = "\n".join(part for part in text_parts if part)
+        return self._extract_json_object(str(content))
 
     def dance_cull_rubric(
         self,
