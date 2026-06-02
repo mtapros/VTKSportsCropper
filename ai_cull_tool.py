@@ -108,6 +108,7 @@ class AICullTool:
         self.enable_burst_var = tk.BooleanVar(value=True)
         self.burst_fps_var = tk.StringVar(value="8")
         self.keep_per_burst_var = tk.StringVar(value="1")
+        self.use_vl_burst_tiebreaker_var = tk.BooleanVar(value=False)
         self.prefer_face_var = tk.BooleanVar(value=True)
 
         self.use_dance_vl_var = tk.BooleanVar(value=True)
@@ -204,6 +205,15 @@ class AICullTool:
 
         tk.Label(self.panel, text="Keep Per Burst", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
         tk.Entry(self.panel, textvariable=self.keep_per_burst_var).pack(fill="x", **pad)
+
+        tk.Checkbutton(
+            self.panel,
+            text="Use VL Burst Tie-Breaker",
+            variable=self.use_vl_burst_tiebreaker_var,
+            bg="#2a2a2a",
+            fg="white",
+            selectcolor="#444",
+        ).pack(anchor="w", **pad)
 
         tk.Checkbutton(
             self.panel,
@@ -339,6 +349,7 @@ class AICullTool:
             "enable_burst": bool(self.enable_burst_var.get()),
             "burst_fps": float(self.burst_fps_var.get().strip() or "8"),
             "keep_per_burst": int(self.keep_per_burst_var.get().strip() or "1"),
+            "use_vl_burst_tiebreaker": bool(self.use_vl_burst_tiebreaker_var.get()),
             "prefer_face": bool(self.prefer_face_var.get()),
             "sport_type": getattr(profile, "sport_type", "generic"),
             "use_dance_vl": bool(self.use_dance_vl_var.get()),
@@ -1540,6 +1551,185 @@ class AICullTool:
             self.app.current_image = previous_image
             self.app.current_af_boxes = previous_af
 
+    def _extract_capture_timestamp(self, image_path: Path) -> tuple[float, str]:
+        try:
+            with Image.open(image_path) as img:
+                exif = img.getexif()
+            if exif:
+                dt_value = exif.get(36867) or exif.get(36868) or exif.get(306)
+                if dt_value:
+                    base = str(dt_value).strip()
+                    dt = datetime.strptime(base, "%Y:%m:%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                    frac = 0.0
+                    subsec = exif.get(37521)
+                    if subsec is not None:
+                        digits = "".join(ch for ch in str(subsec) if ch.isdigit())
+                        if digits:
+                            frac = float(f"0.{digits}")
+                    return dt.timestamp() + frac, "exif"
+        except Exception:
+            pass
+
+        try:
+            return float(image_path.stat().st_mtime), "mtime"
+        except Exception:
+            return 0.0, "none"
+
+    def _build_bursts(self, ordered_paths: list[Path], burst_fps: float) -> list[list[Path]]:
+        if not ordered_paths:
+            return []
+
+        threshold_sec = 1.0 / max(0.1, float(burst_fps))
+        bursts: list[list[Path]] = []
+        current: list[Path] = []
+        prev_ts: float | None = None
+        prev_source: str | None = None
+
+        for path in ordered_paths:
+            ts, source = self._extract_capture_timestamp(Path(path))
+            if not current:
+                current = [Path(path)]
+                prev_ts = ts
+                prev_source = source
+                continue
+
+            delta = ts - float(prev_ts or 0.0)
+            same_burst = False
+            if delta >= 0:
+                if source == "mtime" and prev_source == "mtime" and delta == 0:
+                    same_burst = False
+                else:
+                    same_burst = delta <= threshold_sec
+
+            if same_burst:
+                current.append(Path(path))
+            else:
+                bursts.append(current)
+                current = [Path(path)]
+
+            prev_ts = ts
+            prev_source = source
+
+        if current:
+            bursts.append(current)
+
+        return bursts
+
+    def _rank_burst_candidates(self, burst_results: list[dict]) -> list[dict]:
+        def key(item: dict) -> tuple[float, float, float, float, float]:
+            decision = str(item.get("decision", "Reject"))
+            score = float(item.get("score", 0.0))
+            hero_focus = float(item.get("hero_focus", 0.0))
+            has_face = 1.0 if item.get("has_face", False) else 0.0
+            face_focus = float(item.get("face_focus", 0.0))
+            return (float(self._decision_rank(decision)), score, hero_focus, has_face, face_focus)
+
+        return sorted(burst_results, key=key, reverse=True)
+
+    def _burst_vl_candidates(self, ranked: list[dict], keep_per_burst: int) -> list[dict]:
+        plausible = [r for r in ranked if str(r.get("decision", "Reject")) in {"Keep", "Maybe"}]
+        if len(plausible) >= 2:
+            return plausible[:6]
+
+        if len(ranked) <= max(1, keep_per_burst):
+            return []
+
+        cutoff = max(1, keep_per_burst)
+        if cutoff >= len(ranked):
+            return []
+
+        score_a = float(ranked[cutoff - 1].get("score", 0.0))
+        score_b = float(ranked[cutoff].get("score", 0.0))
+        if abs(score_a - score_b) > 8.0:
+            return []
+
+        return ranked[: min(6, cutoff + 2)]
+
+    def _resolve_vl_frame_choice(self, value: str, candidates: list[dict]) -> dict | None:
+        candidate_by_name: dict[str, dict] = {}
+        candidate_by_path: dict[str, dict] = {}
+        for item in candidates:
+            path = Path(item["path"])
+            candidate_by_name[path.name.lower()] = item
+            candidate_by_path[str(path).lower()] = item
+
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+
+        normalized = raw.lower()
+        if normalized in candidate_by_name:
+            return candidate_by_name[normalized]
+        if normalized in candidate_by_path:
+            return candidate_by_path[normalized]
+
+        if ":" in raw:
+            tail = raw.split(":", 1)[1].strip().lower()
+            if tail in candidate_by_name:
+                return candidate_by_name[tail]
+            if tail in candidate_by_path:
+                return candidate_by_path[tail]
+
+        return None
+
+    def _select_burst_winners_with_vl(
+        self,
+        ranked: list[dict],
+        keep_per_burst: int,
+        config: dict,
+    ) -> tuple[list[dict] | None, dict]:
+        if not bool(config.get("use_vl_burst_tiebreaker", False)):
+            return None, {}
+
+        candidates = self._burst_vl_candidates(ranked, keep_per_burst)
+        if len(candidates) < 2:
+            return None, {}
+
+        try:
+            base_url, model, timeout, temperature, max_tokens = self._dance_lmstudio_settings()
+            client = LMStudioClient(base_url=base_url, timeout=timeout)
+            selection = client.burst_select_frames(
+                model=model,
+                image_paths=[Path(item["path"]) for item in candidates],
+                temperature=max(0.0, min(temperature, 0.4)),
+                max_tokens=max(256, min(max_tokens, 600)),
+            )
+        except Exception as exc:
+            self.app.log(f"AI Cull: VL burst tie-breaker unavailable ({exc}); using heuristic ranking.")
+            return None, {"error": str(exc)}
+
+        chosen: list[dict] = []
+        best = self._resolve_vl_frame_choice(str(selection.get("best_frame", "")), candidates)
+        if best is not None:
+            chosen.append(best)
+
+        for alt in selection.get("alternates", []) or []:
+            alt_item = self._resolve_vl_frame_choice(str(alt), candidates)
+            if alt_item is not None and alt_item not in chosen:
+                chosen.append(alt_item)
+
+        if not chosen:
+            return None, {"error": "VL selector returned no valid frame choice."}
+
+        for fallback in ranked:
+            if len(chosen) >= keep_per_burst:
+                break
+            if fallback not in chosen:
+                chosen.append(fallback)
+
+        meta = {
+            "best_frame": str(selection.get("best_frame", "")),
+            "alternates": list(selection.get("alternates", []) or []),
+            "rejects": list(selection.get("rejects", []) or []),
+            "reason": str(selection.get("reason", "")),
+        }
+        try:
+            meta["confidence"] = float(selection.get("confidence", 0.0))
+        except Exception:
+            meta["confidence"] = 0.0
+
+        return chosen[:keep_per_burst], meta
+
     def apply_burst_suppression_for_pipeline(self, results: list[dict], config: dict) -> list[dict]:
         if not results or not config.get("enable_burst", False):
             return results
@@ -1552,12 +1742,18 @@ class AICullTool:
         for burst_paths in bursts:
             burst_results = [path_to_result[p] for p in burst_paths if p in path_to_result]
             ranked = self._rank_burst_candidates(burst_results)
-            winners = ranked[:keep_per_burst]
+            winners, vl_meta = self._select_burst_winners_with_vl(ranked, keep_per_burst, config)
+            if not winners:
+                winners = ranked[:keep_per_burst]
             winner_paths = {Path(item["path"]) for item in winners}
+            vl_used = bool(vl_meta) and "error" not in vl_meta
 
             for item in burst_results:
                 item["burst_size"] = len(burst_results)
                 item["burst_winner_paths"] = [str(p) for p in winner_paths]
+                item["burst_vl_selector_used"] = vl_used
+                if vl_meta:
+                    item["burst_vl_selector"] = vl_meta
                 if Path(item["path"]) not in winner_paths:
                     item["decision"] = "Reject"
                     item["burst_suppressed"] = True
