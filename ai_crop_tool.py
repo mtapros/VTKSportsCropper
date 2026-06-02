@@ -628,10 +628,20 @@ class AICropTool:
     def rerun(self):
         self.on_image_changed()
 
-    def _get_crop_output_dir(self) -> Path | None:
+    def _resolve_crop_source_folder(self) -> Path | None:
         if self.app.state.input_folder is None:
             return None
-        out_dir = self.app.state.input_folder / "Crops"
+        source_folder = Path(self.app.state.input_folder)
+        keep_folder = source_folder / "Output" / "Keep"
+        if keep_folder.exists() and keep_folder.is_dir():
+            return keep_folder
+        return source_folder
+
+    def _get_crop_output_dir(self) -> Path | None:
+        crop_source = self._resolve_crop_source_folder()
+        if crop_source is None:
+            return None
+        out_dir = crop_source / "Crops"
         out_dir.mkdir(parents=True, exist_ok=True)
         return out_dir
 
@@ -672,13 +682,22 @@ class AICropTool:
             self.app.log("AI Crop: please select an input folder first.")
             return
 
-        if not self.app.state.image_paths:
+        source_folder = Path(self.app.state.input_folder)
+        crop_source = self._resolve_crop_source_folder()
+        if crop_source is None:
+            self.app.log("AI Crop: no crop source folder available.")
+            return
+
+        if source_folder != crop_source:
+            self.app.set_input_folder(str(crop_source))
+            self.app.start_batch()
+        elif not self.app.state.image_paths:
             self.app.log("AI Crop: loading images from input folder...")
             self.app.start_batch()
 
         self.auto_images = [Path(p) for p in self.app.state.image_paths]
         if not self.auto_images:
-            self.app.log("AI Crop: no images found in input folder.")
+            self.app.log("AI Crop: no images found in crop source folder.")
             return
 
         output_dir = self._get_crop_output_dir()
@@ -696,7 +715,7 @@ class AICropTool:
         if self.stop_button is not None:
             self.stop_button.config(state="normal")
 
-        self.app.log(f"AI Crop: starting auto crop on {len(self.auto_images)} image(s)...")
+        self.app.log(f"AI Crop: starting auto crop on {len(self.auto_images)} image(s) from {crop_source}...")
         self.app.root.after(10, self._auto_crop_step)
 
     def _auto_crop_step(self):

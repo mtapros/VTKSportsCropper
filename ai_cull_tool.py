@@ -82,6 +82,7 @@ class DanceCullCache:
 class AICullTool:
     tool_id = "ai_cull"
     display_name = "AI Cull Tool"
+    BURST_EVAL_WINDOW_GEOMETRY = "480x240"
 
     DANCE_PICK_COLORS = [
         ("red", "#FF4D4D"),
@@ -141,7 +142,15 @@ class AICullTool:
         self.auto_mode = "auto_cull"
         self.auto_button = None
         self.burst_button = None
+        self.evaluate_bursts_button = None
+        self.crop_keep_button = None
+        self.lmstudio_settings_button = None
         self.stop_button = None
+        self.burst_eval_window = None
+        self.burst_eval_details_var = tk.StringVar(value="Burst preflight not run.")
+        self.precomputed_burst_state: dict | None = None
+        self.auto_all_images: list[Path] = []
+        self.auto_precomputed_bursts: list[list[Path]] = []
 
         self.dance_frame = None
 
@@ -309,8 +318,38 @@ class AICullTool:
         )
         self.burst_button.pack(fill="x", padx=10, pady=(0, 4))
 
+        self.evaluate_bursts_button = tk.Button(
+            self.panel,
+            text="Evaluate Bursts",
+            command=self.open_burst_evaluation_window,
+        )
+        self.evaluate_bursts_button.pack(fill="x", padx=10, pady=(0, 4))
+
+        tk.Label(
+            self.panel,
+            textvariable=self.burst_eval_details_var,
+            bg="#2a2a2a",
+            fg="#c9d7ff",
+            justify="left",
+            wraplength=300,
+        ).pack(anchor="w", padx=10, pady=(0, 6))
+
         self.auto_button = tk.Button(self.panel, text="Auto Cull Input Folder", command=self.auto_cull_input_folder)
         self.auto_button.pack(fill="x", padx=10, pady=(0, 4))
+
+        self.crop_keep_button = tk.Button(
+            self.panel,
+            text="Crop Output/Keep",
+            command=self.open_keep_bucket_for_cropping,
+        )
+        self.crop_keep_button.pack(fill="x", padx=10, pady=(0, 4))
+
+        self.lmstudio_settings_button = tk.Button(
+            self.panel,
+            text="LM Studio Settings…",
+            command=self.open_lmstudio_settings_window,
+        )
+        self.lmstudio_settings_button.pack(fill="x", padx=10, pady=(0, 4))
 
         self.stop_button = tk.Button(
             self.panel,
@@ -373,7 +412,7 @@ class AICullTool:
     def get_runtime_config(self) -> dict:
         profile = self.get_profile_data()
         prompts = [p.strip() for p in profile.prompts if p.strip()]
-        return {
+        config = {
             "prompts": prompts,
             "detection_mode": self.detection_mode_var.get().strip() or "Phrase Only",
             "keep_threshold": float(self.keep_threshold_var.get().strip() or "80"),
@@ -393,6 +432,167 @@ class AICullTool:
             "save_vl_debug_images": bool(self.save_vl_debug_images_var.get()),
             "show_dance_debug_preview": bool(self.show_dance_debug_preview_var.get()),
         }
+        if self.precomputed_burst_state and self.app.state.input_folder is not None:
+            state_folder = str(self.precomputed_burst_state.get("folder", ""))
+            if state_folder == str(self.app.state.input_folder.resolve()):
+                config["precomputed_burst_groups"] = list(self.precomputed_burst_state.get("groups", []))
+                config["precomputed_burst_fps"] = float(self.precomputed_burst_state.get("fps", config["burst_fps"]))
+        return config
+
+    def open_lmstudio_settings_window(self):
+        tool = self.app.tools_by_id.get("lmstudio")
+        if tool is None or not hasattr(tool, "open_settings_window"):
+            self.app.log("AI Cull: LM Studio tool unavailable.")
+            return
+        tool.open_settings_window()
+
+    def open_keep_bucket_for_cropping(self):
+        if self.app.state.input_folder is None:
+            self.app.log("AI Cull: select an input folder first.")
+            return
+        keep_folder = self.app.state.input_folder / "Output" / "Keep"
+        if not keep_folder.exists() or not keep_folder.is_dir():
+            self.app.log("AI Cull: Output/Keep not found. Run unified pipeline first.")
+            return
+        self.app.set_input_folder(str(keep_folder))
+        self.app.set_active_tool("ai_crop")
+        self.app.log(f"AI Cull: ready to crop keep bucket at {keep_folder}.")
+
+    def _summarize_burst_groups(self, groups: list[list[Path]], total_images: int) -> dict:
+        burst_groups = [g for g in groups if len(g) > 1]
+        burst_images = sum(len(g) for g in burst_groups)
+        largest = max((len(g) for g in burst_groups), default=0)
+        singleton_count = max(0, total_images - burst_images)
+        return {
+            "group_count": len(burst_groups),
+            "burst_images": burst_images,
+            "singleton_images": singleton_count,
+            "largest_group": largest,
+        }
+
+    def prepare_burst_groups_for_paths(
+        self,
+        ordered_paths: list[Path],
+        config: dict | None = None,
+        source_folder: Path | None = None,
+    ) -> dict:
+        runtime = config if config is not None else self.get_runtime_config()
+        fps = float(runtime.get("burst_fps", 8.0))
+        groups = self._build_bursts([Path(p) for p in ordered_paths], fps)
+        summary = self._summarize_burst_groups(groups, len(ordered_paths))
+        folder = source_folder or self.app.state.input_folder
+        if folder is not None:
+            self.precomputed_burst_state = {
+                "folder": str(folder.resolve()),
+                "fps": fps,
+                "groups": [[str(p) for p in g] for g in groups],
+            }
+            if config is not None:
+                config["precomputed_burst_groups"] = list(self.precomputed_burst_state["groups"])
+                config["precomputed_burst_fps"] = fps
+        self.burst_eval_details_var.set(
+            f"Burst preflight @ {fps:.2f} FPS: groups={summary['group_count']}, "
+            f"burst-images={summary['burst_images']}, singles={summary['singleton_images']}, "
+            f"largest={summary['largest_group']}"
+        )
+        return {"fps": fps, "groups": groups, **summary}
+
+    def _resolve_burst_groups(self, ordered_paths: list[Path], config: dict) -> list[list[Path]]:
+        resolved_paths = [Path(p) for p in ordered_paths]
+        raw_groups = config.get("precomputed_burst_groups")
+        if not isinstance(raw_groups, list):
+            return self._build_bursts(resolved_paths, float(config.get("burst_fps", 8.0)))
+
+        path_lookup = {str(p.resolve()): p for p in resolved_paths}
+        groups: list[list[Path]] = []
+        used: set[Path] = set()
+        for raw_group in raw_groups:
+            if not isinstance(raw_group, list):
+                continue
+            group: list[Path] = []
+            for raw_path in raw_group:
+                key = str(Path(raw_path).resolve())
+                path = path_lookup.get(key)
+                if path is None or path in used:
+                    continue
+                group.append(path)
+                used.add(path)
+            if group:
+                groups.append(group)
+
+        if not groups:
+            return self._build_bursts(resolved_paths, float(config.get("burst_fps", 8.0)))
+        return groups
+
+    def _persist_non_burst_defaults(self, all_paths: list[Path], grouped_paths: set[Path]) -> None:
+        for path in all_paths:
+            if path in grouped_paths:
+                continue
+            self._put_cached_entry(Path(path), self._default_burst_metadata_updates())
+
+    @staticmethod
+    def _default_burst_metadata_updates() -> dict:
+        return {
+            "burst_group_id": None,
+            "burst_rank": 0,
+            "burst_size": 1,
+            "burst_suppressed": False,
+            "burst_winner_paths": [],
+            "burst_vl_selector_used": False,
+            "burst_keep_target": 1,
+            "burst_conservative_scene_mode": False,
+        }
+
+    def _run_burst_preflight_scan(self):
+        if self.app.state.input_folder is None:
+            self.app.log("AI Cull: select an input folder first.")
+            return None
+        if not (self.app.state.all_image_paths or self.app.state.image_paths):
+            self.app.start_batch()
+        paths = self._folder_batch_source_paths()
+        if not paths:
+            self.app.log("AI Cull: no images found in input folder.")
+            return None
+        summary = self.prepare_burst_groups_for_paths(paths)
+        self.app.log(
+            f"AI Cull Burst Evaluate: groups={summary['group_count']} "
+            f"burst-images={summary['burst_images']} total={len(paths)} fps={summary['fps']:.2f}"
+        )
+        return summary
+
+    def open_burst_evaluation_window(self):
+        if self.burst_eval_window is not None and self.burst_eval_window.winfo_exists():
+            self.burst_eval_window.deiconify()
+            self.burst_eval_window.lift()
+            self.burst_eval_window.focus_force()
+            return
+
+        win = tk.Toplevel(self.app.root)
+        win.title("Evaluate Bursts")
+        win.geometry(self.BURST_EVAL_WINDOW_GEOMETRY)
+        win.configure(bg="#2a2a2a")
+        self.burst_eval_window = win
+
+        pad = {"padx": 10, "pady": 4}
+        tk.Label(
+            win,
+            text="Fast timestamp-only burst scan",
+            bg="#2a2a2a",
+            fg="white",
+            font=("Arial", 11, "bold"),
+        ).pack(anchor="w", **pad)
+        tk.Label(win, text="Burst FPS Threshold", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+        tk.Entry(win, textvariable=self.burst_fps_var).pack(fill="x", **pad)
+        tk.Button(win, text="Run Burst Scan", command=self._run_burst_preflight_scan).pack(fill="x", padx=10, pady=(8, 6))
+        tk.Label(
+            win,
+            textvariable=self.burst_eval_details_var,
+            bg="#2a2a2a",
+            fg="#c9d7ff",
+            justify="left",
+            wraplength=440,
+        ).pack(anchor="w", padx=10, pady=(4, 6))
+        tk.Button(win, text="Close", command=win.destroy).pack(fill="x", padx=10, pady=(6, 8))
 
     def _is_ball_label(self, label: str) -> bool:
         return "ball" in label.lower()
@@ -1990,11 +2190,15 @@ class AICullTool:
 
         path_to_result = {Path(r["path"]): r for r in results}
         ordered_paths = [Path(r["path"]) for r in results]
-        bursts = self._build_bursts(ordered_paths, float(config.get("burst_fps", 8.0)))
+        bursts = self._resolve_burst_groups(ordered_paths, config)
         keep_per_burst = max(1, int(config.get("keep_per_burst", 1)))
 
         for burst_index, burst_paths in enumerate(bursts, start=1):
             burst_results = [path_to_result[p] for p in burst_paths if p in path_to_result]
+            if len(burst_results) < 2:
+                for item in burst_results:
+                    item.update(self._default_burst_metadata_updates())
+                continue
             ranked = self._rank_burst_candidates(burst_results)
             has_static_group_pose = any(self._scene_is_static_group_pose(item) for item in burst_results)
             keep_target = keep_per_burst
@@ -2047,6 +2251,9 @@ class AICullTool:
                 burst_updates["burst_vl_selector"] = dict(item.get("burst_vl_selector", {}))
             self._put_cached_entry(image_path, burst_updates)
 
+    def persist_burst_suppression_results(self, results: list[dict]) -> None:
+        self._persist_burst_suppression_results(results)
+
     def _folder_batch_source_paths(self) -> list[Path]:
         return [Path(p) for p in (self.app.state.all_image_paths or self.app.state.image_paths)]
 
@@ -2063,10 +2270,26 @@ class AICullTool:
             self.app.log("AI Cull: loading images from input folder...")
             self.app.start_batch()
 
-        self.auto_images = self._folder_batch_source_paths()
-        if not self.auto_images:
+        self.auto_all_images = self._folder_batch_source_paths()
+        if not self.auto_all_images:
             self.app.log("AI Cull: no images found in input folder.")
             return
+
+        burst_summary = self.prepare_burst_groups_for_paths(self.auto_all_images)
+        all_groups = burst_summary.get("groups", [])
+        burst_groups = [list(group) for group in all_groups if len(group) > 1]
+        burst_paths: list[Path] = []
+        for group in burst_groups:
+            burst_paths.extend(group)
+
+        if not burst_groups:
+            self._persist_non_burst_defaults(self.auto_all_images, set())
+            self.app.refresh_image_browser()
+            self.app.log("AI Cull Burst Suppression: no burst groups found at current FPS.")
+            return
+
+        self.auto_precomputed_bursts = burst_groups
+        self.auto_images = burst_paths
 
         self.auto_results = []
         self.auto_index = 0
@@ -2082,8 +2305,9 @@ class AICullTool:
             self.stop_button.config(state="normal")
 
         self.app.log(
-            f"AI Cull Burst Suppression: starting folder-wide pass on {len(self.auto_images)} image(s) "
-            "(heuristic burst grouping first; VL tie-breaker only inside grouped bursts when enabled)."
+            f"AI Cull Burst Suppression: starting burst-only pass on {len(self.auto_images)} image(s) "
+            f"across {len(self.auto_precomputed_bursts)} burst group(s) "
+            "(timestamp grouping first; VL tie-breaker only inside grouped bursts when enabled)."
         )
         self.app.root.after(10, self._auto_cull_step)
 
@@ -2391,22 +2615,32 @@ class AICullTool:
     def rerun(self):
         self.on_image_changed()
 
-    def _get_cull_output_dir(self, decision: str) -> Path | None:
+    def _decision_bucket_name(self, decision: str, burst_suppressed: bool = False) -> str:
+        if burst_suppressed:
+            return "Reject-Bursts"
+        mapped = str(decision or "Reject").strip()
+        if mapped not in {"Keep", "Maybe", "Reject"}:
+            mapped = "Reject"
+        return mapped
+
+    def _get_cull_output_dir(self, decision: str, burst_suppressed: bool = False) -> Path | None:
         if self.app.state.input_folder is None:
             return None
-        out_dir = self.app.state.input_folder / "Cull" / decision
+        mapped = self._decision_bucket_name(decision, burst_suppressed=burst_suppressed)
+        out_dir = self.app.state.input_folder / "Output" / mapped
         out_dir.mkdir(parents=True, exist_ok=True)
         return out_dir
 
-    def _copy_image_to_decision_folder(self, source: Path, decision: str, score: float):
-        output_dir = self._get_cull_output_dir(decision)
+    def _copy_image_to_decision_folder(self, source: Path, decision: str, score: float, burst_suppressed: bool = False):
+        bucket = self._decision_bucket_name(decision, burst_suppressed=burst_suppressed)
+        output_dir = self._get_cull_output_dir(bucket)
         if output_dir is None:
             self.app.log("AI Cull: no input folder selected.")
             return
 
         destination = output_dir / source.name
         shutil.copy2(source, destination)
-        self.app.log(f"AI Cull: copied {source.name} -> {decision} ({score:.1f})")
+        self.app.log(f"AI Cull: copied {source.name} -> {bucket} ({score:.1f})")
 
     def stop_auto_cull(self):
         if not self.auto_running:
@@ -2462,8 +2696,11 @@ class AICullTool:
             if self.auto_mode == "burst_suppression":
                 config = self.get_runtime_config()
                 config["enable_burst"] = True
+                config["precomputed_burst_groups"] = [[str(p) for p in group] for group in self.auto_precomputed_bursts]
                 suppressed_results = self.apply_burst_suppression_for_pipeline(self.auto_results, config)
                 self._persist_burst_suppression_results(suppressed_results)
+                burst_member_paths = {p for group in self.auto_precomputed_bursts for p in group}
+                self._persist_non_burst_defaults(self.auto_all_images, burst_member_paths)
                 self.app.refresh_image_browser()
 
                 burst_group_ids = {
@@ -2476,7 +2713,8 @@ class AICullTool:
                 self.app.log(
                     f"AI Cull Burst Suppression: complete. "
                     f"Bursts={len([g for g in burst_group_ids if g])}, "
-                    f"kept={kept_count}, suppressed={suppressed_count}"
+                    f"kept={kept_count}, suppressed={suppressed_count}, "
+                    f"non-burst={max(0, len(self.auto_all_images) - len(burst_member_paths))}"
                 )
                 self._finish_auto_cull(cancelled=False)
                 return
@@ -2496,6 +2734,8 @@ class AICullTool:
             if self.auto_mode != "burst_suppression":
                 self.app.state.current_index = self.auto_index
                 self.app.load_current_image()
+            else:
+                config["precomputed_burst_groups"] = [[str(p) for p in group] for group in self.auto_precomputed_bursts]
             result = self.evaluate_image_for_pipeline(image_path, config)
             self.auto_results.append(result)
             if self.auto_mode == "burst_suppression":
@@ -2525,6 +2765,8 @@ class AICullTool:
         self.auto_running = False
         self.auto_cancel_requested = False
         self.auto_mode = "auto_cull"
+        self.auto_all_images = []
+        self.auto_precomputed_bursts = []
 
         if self.auto_button is not None:
             self.auto_button.config(state="normal")
