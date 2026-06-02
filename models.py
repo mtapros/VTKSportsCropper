@@ -52,13 +52,14 @@ class SportProfile:
     safe_ratios: dict[str, bool] = field(default_factory=lambda: {"2:3": True, "5:7": True, "1:1": False})
 
     sport_type: str = "generic"
+    vl_rubric_name: str = "generic"
 
-    dance_prefer_full_body: bool = True
-    dance_penalize_cropped_feet: bool = True
-    dance_favor_symmetry: bool = False
-    dance_favor_peak_action: bool = True
-    dance_prefer_clean_pose: bool = True
-    dance_prefer_single_subject: bool = False
+    prefer_full_body: bool = False
+    penalize_cropped_feet: bool = False
+    favor_symmetry: bool = False
+    favor_peak_action: bool = False
+    prefer_clean_pose: bool = False
+    prefer_single_subject: bool = False
 
 
 @dataclass

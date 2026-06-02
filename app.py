@@ -5,6 +5,7 @@ import tkinter as tk
 
 from ai_crop_tool import AICropTool
 from ai_cull_tool import AICullTool
+from cached_crop_tool import CachedCropTool
 from lmstudio_tool import LMStudioTool
 from pipeline_tool import PipelineTool
 from core import ImageRepository, get_af_points_and_boxes
@@ -50,10 +51,18 @@ class SportsToolkitApp:
         ai_crop_tool = AICropTool(self)
         manual_tool = ManualCropTool(self)
         ai_cull_tool = AICullTool(self)
+        cached_crop_tool = CachedCropTool(self)
         pipeline_tool = PipelineTool(self)
         lmstudio_tool = LMStudioTool(self)
 
-        for tool in [ai_crop_tool, manual_tool, ai_cull_tool, pipeline_tool, lmstudio_tool]:
+        for tool in [
+            ai_crop_tool,
+            manual_tool,
+            ai_cull_tool,
+            cached_crop_tool,
+            pipeline_tool,
+            lmstudio_tool,
+        ]:
             self.tools[tool.tool_id] = tool
             self.tool_display_to_id[tool.display_name] = tool.tool_id
 
@@ -201,9 +210,9 @@ class SportsToolkitApp:
         self.ui.highlight_thumbnail_index(self.state.current_index)
         self._refresh_header_info()
 
-        if self.current_af_boxes:
+        if self.current_af_boxes and self.state.active_tool_id != "cached_crop":
             self.log(f"Loaded {len(self.current_af_boxes)} AF box(es).")
-        elif self.current_af_points:
+        elif self.current_af_points and self.state.active_tool_id != "cached_crop":
             self.log(f"Loaded {len(self.current_af_points)} AF point(s).")
 
         self.log(f"Loaded: {path.name}")
@@ -271,11 +280,14 @@ class SportsToolkitApp:
         return list(self.tool_display_to_id.keys())
 
     def set_overlays(self, boxes: list[CropBox]):
-        af_overlays = [
-            CropBox(name=f"AF_{i+1}", bbox=box, color="#FF00FF")
-            for i, box in enumerate(self.current_af_boxes)
-        ]
-        self.current_overlay_boxes = af_overlays + boxes
+        if self.state.active_tool_id == "cached_crop":
+            self.current_overlay_boxes = list(boxes)
+        else:
+            af_overlays = [
+                CropBox(name=f"AF_{i+1}", bbox=box, color="#FF00FF")
+                for i, box in enumerate(self.current_af_boxes)
+            ]
+            self.current_overlay_boxes = af_overlays + boxes
         self.ui.set_overlay_boxes(self.current_overlay_boxes)
 
     def set_manual_boxes(self, boxes):

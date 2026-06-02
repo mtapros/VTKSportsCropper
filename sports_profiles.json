@@ -17,7 +17,14 @@
       "2:3": true,
       "5:7": true,
       "1:1": false
-    }
+    },
+    "sport_type": "generic",
+    "dance_prefer_full_body": false,
+    "dance_penalize_cropped_feet": false,
+    "dance_favor_symmetry": false,
+    "dance_favor_peak_action": false,
+    "dance_prefer_clean_pose": false,
+    "dance_prefer_single_subject": false
   },
   "Soccer": {
     "prompts": [
@@ -37,7 +44,14 @@
       "2:3": true,
       "5:7": true,
       "1:1": false
-    }
+    },
+    "sport_type": "soccer",
+    "dance_prefer_full_body": false,
+    "dance_penalize_cropped_feet": false,
+    "dance_favor_symmetry": false,
+    "dance_favor_peak_action": false,
+    "dance_prefer_clean_pose": false,
+    "dance_prefer_single_subject": false
   },
   "Football": {
     "prompts": [
@@ -57,7 +71,14 @@
       "2:3": true,
       "5:7": true,
       "1:1": false
-    }
+    },
+    "sport_type": "generic",
+    "dance_prefer_full_body": false,
+    "dance_penalize_cropped_feet": false,
+    "dance_favor_symmetry": false,
+    "dance_favor_peak_action": false,
+    "dance_prefer_clean_pose": false,
+    "dance_prefer_single_subject": false
   },
   "Dance": {
     "prompts": [
@@ -77,6 +98,36 @@
       "2:3": true,
       "5:7": true,
       "1:1": false
-    }
+    },
+    "sport_type": "dance",
+    "dance_prefer_full_body": true,
+    "dance_penalize_cropped_feet": true,
+    "dance_favor_symmetry": false,
+    "dance_favor_peak_action": true,
+    "dance_prefer_clean_pose": true,
+    "dance_prefer_single_subject": false
+  },
+  "Generic": {
+    "prompts": [
+      "face",
+      "person",
+      "dancer",
+      ""
+    ],
+    "focus_min": 0.0,
+    "focus_relative": 0.0,
+    "edge_margin": 0,
+    "margin_buffer": 0.0,
+    "main_ratio": "4:5",
+    "auto_rotate": false,
+    "join_descriptors": false,
+    "safe_ratios": {},
+    "sport_type": "dance",
+    "dance_prefer_full_body": true,
+    "dance_penalize_cropped_feet": true,
+    "dance_favor_symmetry": false,
+    "dance_favor_peak_action": true,
+    "dance_prefer_clean_pose": true,
+    "dance_prefer_single_subject": false
   }
 }

@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from urllib import error, request
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 
 class LMStudioClient:
@@ -79,12 +79,13 @@ class LMStudioClient:
     def _image_file_to_data_url(
         self,
         image_path: str | Path,
-        max_side: int = 1536,
+        max_side: int = 1024,
         jpeg_quality: int = 90,
     ) -> str:
         path = Path(image_path)
 
         with Image.open(path) as img:
+            img = ImageOps.exif_transpose(img)
             img = img.convert("RGB")
 
             w, h = img.size
@@ -196,6 +197,7 @@ class LMStudioClient:
             "- sharpness\n"
             "- subject_visibility\n"
             "- face_visibility\n"
+            "- face_facing_camera\n"
             "- full_body_visibility\n"
             "- feet_visibility\n"
             "- hands_visibility\n"
@@ -211,6 +213,7 @@ class LMStudioClient:
             "- sharpness: strong, acceptable, soft, blurry\n"
             "- subject_visibility: strong, good, partial, weak\n"
             "- face_visibility: clear, partial, not_visible\n"
+            "- face_facing_camera: yes, partial, no, unknown\n"
             "- full_body_visibility: full, mostly_full, partial\n"
             "- feet_visibility: fully_visible, partially_cropped, cropped_out\n"
             "- hands_visibility: fully_visible, partially_cropped, cropped_out\n"
@@ -224,6 +227,8 @@ class LMStudioClient:
             "- confidence must be a number between 0 and 1\n"
             "- summary must be one short sentence\n"
             "- Be conservative and practical for dance recital photo delivery.\n"
+            "- If the visible face is turned away or strongly sideways, set face_facing_camera to no.\n"
+            "- If the face is only somewhat toward camera, set face_facing_camera to partial.\n"
         )
 
         user_prompt = (
@@ -231,6 +236,7 @@ class LMStudioClient:
             "Focus on:\n"
             "- whether the dancer is sharp and clearly visible\n"
             "- whether the face is visible\n"
+            "- whether the face is facing the camera\n"
             "- whether the full body, feet, and hands are visible\n"
             "- whether the pose is clean and aesthetically usable\n"
             "- whether the moment is strong enough to keep\n"

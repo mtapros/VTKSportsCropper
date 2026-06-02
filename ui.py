@@ -155,10 +155,27 @@ class MainWindow:
         banner.pack(fill="x", padx=10, pady=(10, 12))
         self.module_banner = banner
 
-        tk.Label(banner, textvariable=self.module_title_var, bg="#1d3557", fg="white", font=("Arial", 14, "bold"), anchor="w", justify=tk.LEFT).pack(fill="x", padx=12, pady=(10, 2))
+        tk.Label(
+            banner,
+            textvariable=self.module_title_var,
+            bg="#1d3557",
+            fg="white",
+            font=("Arial", 14, "bold"),
+            anchor="w",
+            justify=tk.LEFT,
+        ).pack(fill="x", padx=12, pady=(10, 2))
         self.module_title_label = banner.winfo_children()[-1]
 
-        tk.Label(banner, textvariable=self.module_subtitle_var, bg="#1d3557", fg="#dbe7f5", font=("Arial", 9), anchor="w", justify=tk.LEFT, wraplength=280).pack(fill="x", padx=12, pady=(0, 10))
+        tk.Label(
+            banner,
+            textvariable=self.module_subtitle_var,
+            bg="#1d3557",
+            fg="#dbe7f5",
+            font=("Arial", 9),
+            anchor="w",
+            justify=tk.LEFT,
+            wraplength=280,
+        ).pack(fill="x", padx=12, pady=(0, 10))
         self.module_subtitle_label = banner.winfo_children()[-1]
 
         tk.Label(self.left_inner, text="Module Controls", bg="#2a2a2a", fg="white", font=("Arial", 11, "bold")).pack(anchor="w", padx=10, pady=(0, 6))
@@ -267,6 +284,7 @@ class MainWindow:
             "AI Crop Tool": "Automated subject-driven crop recommendations",
             "Manual Crop Tool": "Manual subject selection and crop building",
             "AI Cull Tool": "AI-assisted image culling, ranking, and filtering",
+            "Cached Crop Tool": "Cache-driven crop preview with nested ratio guides and batch commit",
             "Full Trial Pipeline": "Automated cull-to-crop batch run with live visual progress",
             "LM Studio Test": "LM Studio local model test and vision prompt debugging",
         }
@@ -275,6 +293,7 @@ class MainWindow:
             "AI Crop Tool": ("#1d3557", "#dbe7f5"),
             "Manual Crop Tool": ("#6a3f00", "#ffe7c2"),
             "AI Cull Tool": ("#3f2a56", "#eadbff"),
+            "Cached Crop Tool": ("#5a3a1a", "#ffe8cf"),
             "Full Trial Pipeline": ("#1f5c42", "#d8ffef"),
             "LM Studio Test": ("#3f2a56", "#eadbff"),
         }
@@ -469,10 +488,12 @@ class MainWindow:
             if bbox:
                 bg = self.canvas.create_rectangle(bbox[0] - 4, bbox[1] - 2, bbox[2] + 4, bbox[3] + 2, fill="black", outline=color, width=1)
                 self.canvas.tag_lower(bg, txt)
-                self.manual_hitboxes.append({
-                    "id": det.id,
-                    "bbox": (bbox[0] - 6, bbox[1] - 4, bbox[2] + 6, bbox[3] + 4)
-                })
+                self.manual_hitboxes.append(
+                    {
+                        "id": det.id,
+                        "bbox": (bbox[0] - 6, bbox[1] - 4, bbox[2] + 6, bbox[3] + 4),
+                    }
+                )
 
             info = self.canvas.create_text(x1 + 8, y1 + 28, text=det.label, fill=det.color, anchor="nw", font=("Arial", 9, "bold"))
             info_bbox = self.canvas.bbox(info)
@@ -486,8 +507,9 @@ class MainWindow:
             x2 = crop.bbox.x2 * scale
             y2 = crop.bbox.y2 * scale
             self.canvas.create_rectangle(x1, y1, x2, y2, outline=crop.color, width=3)
-            text_id = self.canvas.create_text(x1 + 6, y1 + 20, text=crop.name, fill=crop.color, anchor="nw", font=("Arial", 10, "bold"))
-            tb = self.canvas.bbox(text_id)
-            if tb:
-                bg = self.canvas.create_rectangle(tb[0] - 2, tb[1] - 2, tb[2] + 2, tb[3] + 2, fill="black", outline="")
-                self.canvas.tag_lower(bg, text_id)
+            if crop.name:
+                text_id = self.canvas.create_text(x1 + 6, y1 + 20, text=crop.name, fill=crop.color, anchor="nw", font=("Arial", 10, "bold"))
+                tb = self.canvas.bbox(text_id)
+                if tb:
+                    bg = self.canvas.create_rectangle(tb[0] - 2, tb[1] - 2, tb[2] + 2, tb[3] + 2, fill="black", outline="")
+                    self.canvas.tag_lower(bg, text_id)

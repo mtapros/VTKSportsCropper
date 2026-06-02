@@ -9,7 +9,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk
 
-from PIL import Image, ExifTags, ImageDraw, ImageFont
+from PIL import Image, ImageOps, ExifTags, ImageDraw, ImageFont
 
 from core import (
     build_crop_around_subject,
@@ -22,33 +22,15 @@ from lmstudio_client import LMStudioClient
 from models import CropBox, Detection, SportProfile, BoundingBox
 
 
-# ---------------------------------------------------------------------------
-# Cache schema version — bump this string to invalidate all stored entries
-# whenever the prompts, scoring rules, or data layout change.
-# ---------------------------------------------------------------------------
 DANCE_CULL_SCHEMA_VERSION = "dance_v2"
 
 
 class DanceCullCache:
-    """Disk-backed per-folder cache for dance culling results.
-
-    Persists Florence detections, VL responses, mismatch flags, crop proposals,
-    and cull decisions so reruns can skip expensive model calls.
-
-    Cache entries are keyed by ``image_name|mtime_ms|rules_hash`` so stale
-    entries are automatically bypassed when the image file changes or the
-    rules hash changes (different VL model or schema version bump).
-    """
-
     def __init__(self, folder: Path) -> None:
         self._path = Path(folder) / "VL_Debug" / "dance_cull_cache.json"
         self._entries: dict[str, dict] = {}
         self._dirty = False
         self._load()
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _entry_key(self, image_path: Path, rules_hash: str) -> str:
         try:
@@ -69,12 +51,7 @@ class DanceCullCache:
             pass
         self._entries = {}
 
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
-
     def save(self) -> None:
-        """Flush dirty entries to disk."""
         if not self._dirty:
             return
         try:
@@ -91,11 +68,9 @@ class DanceCullCache:
             pass
 
     def get(self, image_path: Path, rules_hash: str) -> dict | None:
-        """Return cached entry for *image_path* + *rules_hash*, or ``None``."""
         return self._entries.get(self._entry_key(image_path, rules_hash))
 
     def put(self, image_path: Path, rules_hash: str, entry: dict) -> None:
-        """Store *entry* and flush to disk."""
         self._entries[self._entry_key(image_path, rules_hash)] = entry
         self._dirty = True
         self.save()
@@ -113,6 +88,8 @@ class AICullTool:
         ("magenta", "#FF5CFF"),
         ("orange", "#FF9A3D"),
     ]
+
+    VL_TARGET_LONG_EDGE = 1024
 
     def __init__(self, app):
         self.app = app
@@ -381,12 +358,13 @@ class AICullTool:
         person_terms = ["person", "player", "athlete", "goalkeeper", "man", "woman", "boy", "girl", "dancer", "face"]
         return any(term in label for term in person_terms)
 
-    def _is_full_person_label(self, label: str) -> bool:
-        """Return True only for full-person / dancer labels — excludes face-only detections.
+    def _prompts_include_ball(self, prompts: list[str]) -> bool:
+        for prompt in prompts:
+            if "ball" in prompt.strip().lower():
+                return True
+        return False
 
-        Used to build the VL subject-picker candidate set so the model is never
-        asked to choose between face crops and whole-dancer boxes.
-        """
+    def _is_full_person_label(self, label: str) -> bool:
         if self._is_face_label(label):
             return False
         label = label.lower()
@@ -394,12 +372,6 @@ class AICullTool:
         return any(term in label for term in person_terms)
 
     def _filter_nested_detections(self, detections: list[Detection]) -> list[Detection]:
-        """Remove detections whose bounding box is substantially contained within a larger box.
-
-        Any detection whose area is ≥ 70 % covered by a larger detection in the
-        same list is considered a nested / inner box (e.g. a face box inside a
-        full-person box) and is excluded.
-        """
         filtered: list[Detection] = []
         for det in detections:
             det_area = det.bbox.width * det.bbox.height
@@ -413,7 +385,6 @@ class AICullTool:
                 other_area = other.bbox.width * other.bbox.height
                 if other_area <= det_area:
                     continue
-                # Compute intersection fraction of det inside other
                 ix1 = max(det.bbox.x1, other.bbox.x1)
                 iy1 = max(det.bbox.y1, other.bbox.y1)
                 ix2 = min(det.bbox.x2, other.bbox.x2)
@@ -427,41 +398,21 @@ class AICullTool:
         return filtered
 
     def _vl_candidate_people(self, all_people: list[Detection]) -> list[Detection]:
-        """Return the subset of *all_people* suitable as VL subject-picker candidates.
-
-        Excludes:
-        - Detections with face-only labels (``_is_full_person_label`` returns False).
-        - Detections whose bounding box is substantially nested inside a larger box.
-        """
         full_person = [d for d in all_people if self._is_full_person_label(d.label)]
         return self._filter_nested_detections(full_person)
 
-    # ------------------------------------------------------------------
-    # Cache helpers
-    # ------------------------------------------------------------------
-
     def _dance_rules_hash(self) -> str:
-        """Short hash identifying the current VL model + schema version.
-
-        Used as part of the disk-cache key so that changing the model or
-        bumping ``DANCE_CULL_SCHEMA_VERSION`` automatically invalidates all
-        stored entries.
-        """
         try:
             tool = self.app.tools_by_id.get("lmstudio")
             model = tool.model_var.get().strip() if tool else ""
         except Exception:
             model = ""
-        raw = f"{DANCE_CULL_SCHEMA_VERSION}|{model}"
+        raw = f"{DANCE_CULL_SCHEMA_VERSION}|{model}|vl1024|bigbadges|fullbatchflow"
         return hashlib.md5(raw.encode()).hexdigest()[:12]
 
     def _get_dance_cull_cache(self, image_path: Path) -> DanceCullCache:
         folder = self.app.state.input_folder or image_path.parent
         return DanceCullCache(Path(folder))
-
-    # ------------------------------------------------------------------
-    # Detection serialisation helpers (for cache persistence)
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _det_to_dict(det: Detection) -> dict:
@@ -484,10 +435,6 @@ class AICullTool:
             source=d.get("source", "cache"),
         )
 
-    # ------------------------------------------------------------------
-    # Crop-awareness helpers
-    # ------------------------------------------------------------------
-
     def _compute_crop_proposal(
         self,
         subject: Detection | None,
@@ -496,17 +443,6 @@ class AICullTool:
         ratio_str: str = "4:5",
         margin_pct: float = 12.0,
     ) -> tuple[BoundingBox | None, float]:
-        """Compute a crop box and a centre-offset penalty for *subject*.
-
-        Returns ``(crop_box, penalty)`` where *penalty* is ≤ 0:
-
-        * ``0.0`` — subject is well-centred, no penalty.
-        * ``-5.0`` … ``-15.0`` — subject is significantly off-centre and will
-          produce a crop that cuts off important content.
-
-        The crop proposal reuses the same ``build_crop_around_subject`` logic
-        used by the AI Crop tool, so results are consistent across tools.
-        """
         if subject is None or img_w <= 0 or img_h <= 0:
             return None, 0.0
 
@@ -518,14 +454,12 @@ class AICullTool:
             margin_pct=margin_pct,
         )
 
-        # Normalised offset from image centre (0 = centred, 0.5 = at edge)
         subject_cx = (subject.bbox.x1 + subject.bbox.x2) / 2.0
         subject_cy = (subject.bbox.y1 + subject.bbox.y2) / 2.0
         dx_norm = abs(subject_cx - img_w / 2.0) / img_w
         dy_norm = abs(subject_cy - img_h / 2.0) / img_h
         max_offset = max(dx_norm, dy_norm)
 
-        # Graduated penalty: no penalty within 10 % of centre
         if max_offset < 0.10:
             penalty = 0.0
         elif max_offset < 0.25:
@@ -535,16 +469,7 @@ class AICullTool:
 
         return crop, round(penalty, 2)
 
-    # ------------------------------------------------------------------
-    # Manual-review logging
-    # ------------------------------------------------------------------
-
     def _log_manual_review_entry(self, image_path: Path, context: dict) -> None:
-        """Append a JSON line to ``manual_review.jsonl`` inside ``VL_Debug``.
-
-        Each line is a self-contained JSON object that preserves enough context
-        to understand exactly what the model saw and how the code interpreted it.
-        """
         try:
             debug_dir = self._dance_debug_dir(image_path)
             log_path = debug_dir / "manual_review.jsonl"
@@ -557,10 +482,6 @@ class AICullTool:
                 f.write(json.dumps(entry, default=str) + "\n")
         except Exception:
             pass
-        for prompt in prompts:
-            if "ball" in prompt.strip().lower():
-                return True
-        return False
 
     def _dedupe_detections(self, detections: list[Detection]) -> list[Detection]:
         detections = sorted(detections, key=lambda d: d.bbox.width * d.bbox.height, reverse=True)
@@ -701,7 +622,6 @@ class AICullTool:
 
         phrase_only_prompts = self._unique_preserve_order(prompts)
         cache_key = self._cache_key(image_path, phrase_only_prompts, "phrase_only_v4_blur_gate")
-
         if cache_key in self.app.ai_detection_cache:
             self.app.log("AI Cull: using cached phrase-only Florence detections.")
             return self.app.ai_detection_cache[cache_key]
@@ -848,6 +768,7 @@ class AICullTool:
         score += {"strong": 20, "acceptable": 12, "soft": -5, "blurry": -25}.get(str(rubric.get("sharpness", "")).strip().lower(), 0)
         score += {"strong": 15, "good": 10, "partial": 0, "weak": -15}.get(str(rubric.get("subject_visibility", "")).strip().lower(), 0)
         score += {"clear": 10, "partial": 3, "not_visible": -6}.get(str(rubric.get("face_visibility", "")).strip().lower(), 0)
+        score += {"yes": 8, "partial": 2, "no": -20, "unknown": 0}.get(str(rubric.get("face_facing_camera", "")).strip().lower(), 0)
         score += {"full": 12, "mostly_full": 6, "partial": -10}.get(str(rubric.get("full_body_visibility", "")).strip().lower(), 0)
         score += {"fully_visible": 10, "partially_cropped": -4, "cropped_out": -15}.get(str(rubric.get("feet_visibility", "")).strip().lower(), 0)
         score += {"fully_visible": 6, "partially_cropped": -2, "cropped_out": -8}.get(str(rubric.get("hands_visibility", "")).strip().lower(), 0)
@@ -863,8 +784,11 @@ class AICullTool:
         moment_quality = str(rubric.get("moment_quality", "")).strip().lower()
         full_body_visibility = str(rubric.get("full_body_visibility", "")).strip().lower()
         feet_visibility = str(rubric.get("feet_visibility", "")).strip().lower()
+        face_facing_camera = str(rubric.get("face_facing_camera", "")).strip().lower()
 
         if sharpness == "blurry" or subject_visibility == "weak":
+            return score, "Reject"
+        if face_facing_camera == "no":
             return score, "Reject"
         if pose_quality == "unclear" and moment_quality == "weak":
             return score, "Reject"
@@ -877,6 +801,20 @@ class AICullTool:
         if score >= 30:
             return score, "Maybe"
         return score, "Reject"
+
+    def _load_rgb_image(self, image_path: Path) -> Image.Image:
+        with Image.open(image_path) as img:
+            img = ImageOps.exif_transpose(img)
+            return img.convert("RGB")
+
+    def _scale_image_to_long_edge(self, image: Image.Image, long_edge: int) -> Image.Image:
+        w, h = image.size
+        longest = max(w, h)
+        if longest <= long_edge:
+            return image
+        scale = long_edge / float(longest)
+        new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+        return image.resize(new_size, Image.LANCZOS)
 
     def _hex_to_rgba(self, hex_color: str, alpha: int) -> tuple[int, int, int, int]:
         hex_color = hex_color.lstrip("#")
@@ -892,10 +830,6 @@ class AICullTool:
         out = Path(base) / "VL_Debug"
         out.mkdir(parents=True, exist_ok=True)
         return out
-
-    def _load_rgb_image(self, image_path: Path) -> Image.Image:
-        with Image.open(image_path) as img:
-            return img.convert("RGB")
 
     def _font(self, size: int = 18):
         try:
@@ -932,7 +866,7 @@ class AICullTool:
         text_w = right - left
         text_h = bottom - top
         box = [x, y, x + text_w + pad_x * 2, y + text_h + pad_y * 2]
-        draw.rounded_rectangle(box, radius=8, fill=fill, outline=outline, width=2)
+        draw.rounded_rectangle(box, radius=10, fill=fill, outline=outline, width=3)
         draw.text((x + pad_x, y + pad_y), text, fill=text_fill, font=font)
         return box
 
@@ -941,84 +875,116 @@ class AICullTool:
         y = max(4, min(y, img_h - h - 4))
         return x, y
 
-    def _draw_florence_candidates_preview(self, image_path: Path, detections: list[Detection]) -> Image.Image:
-        img = self._load_rgb_image(image_path)
-        draw = ImageDraw.Draw(img, "RGBA")
-        font_id = self._font(24)
-        font_label = self._font(18)
+    def _scaled_detection(self, det: Detection, sx: float, sy: float) -> Detection:
+        return Detection(
+            id=det.id,
+            label=det.label,
+            bbox=BoundingBox(
+                int(round(det.bbox.x1 * sx)),
+                int(round(det.bbox.y1 * sy)),
+                int(round(det.bbox.x2 * sx)),
+                int(round(det.bbox.y2 * sy)),
+            ),
+            color=det.color,
+            source=det.source,
+        )
 
-        line_width = max(5, int(max(img.size) * 0.006))
+    def _prepare_scaled_debug_image(self, image_path: Path, detections: list[Detection]) -> tuple[Image.Image, list[Detection]]:
+        img = self._load_rgb_image(image_path)
+        orig_w, orig_h = img.size
+        scaled_img = self._scale_image_to_long_edge(img, self.VL_TARGET_LONG_EDGE)
+        new_w, new_h = scaled_img.size
+
+        sx = new_w / float(orig_w) if orig_w else 1.0
+        sy = new_h / float(orig_h) if orig_h else 1.0
+        scaled_dets = [self._scaled_detection(d, sx, sy) for d in detections]
+        return scaled_img, scaled_dets
+
+    def _draw_florence_candidates_preview(self, image_path: Path, detections: list[Detection]) -> Image.Image:
+        img, detections = self._prepare_scaled_debug_image(image_path, detections)
+        draw = ImageDraw.Draw(img, "RGBA")
+
+        base = max(img.size)
+        font_id = self._font(max(52, int(base * 0.055)))
+        font_label = self._font(max(34, int(base * 0.032)))
+        line_width = max(8, int(base * 0.010))
 
         for det in detections:
             bbox = det.bbox
             color = "#33D6FF"
             color_rgba = self._hex_to_rgba(color, 255)
-            fill_rgba = self._hex_to_rgba(color, 45)
+            fill_rgba = self._hex_to_rgba(color, 55)
 
             draw.rectangle([bbox.x1, bbox.y1, bbox.x2, bbox.y2], outline=color_rgba, width=line_width)
             draw.rectangle([bbox.x1, bbox.y1, bbox.x2, bbox.y2], fill=fill_rgba)
 
             id_text = f"ID {det.id}"
-            id_box_w = self._text_bbox(draw, id_text, font_id)[2] + 16
-            id_box_h = self._text_bbox(draw, id_text, font_id)[3] + 10
+            id_box = self._text_bbox(draw, id_text, font_id)
+            id_w = (id_box[2] - id_box[0]) + 28
+            id_h = (id_box[3] - id_box[1]) + 18
+            cx = (bbox.x1 + bbox.x2) // 2
+            cy = (bbox.y1 + bbox.y2) // 2
             id_x, id_y = self._clamp_label_position(
                 img.width,
                 img.height,
-                bbox.x1 + 6,
-                bbox.y1 + 6,
-                id_box_w,
-                id_box_h,
+                cx - (id_w // 2),
+                cy - id_h - 10,
+                id_w,
+                id_h,
             )
             self._draw_badge(
                 draw,
                 id_x,
                 id_y,
                 id_text,
-                fill=(0, 0, 0, 225),
+                fill=(0, 0, 0, 235),
                 outline=color_rgba,
                 text_fill=(255, 255, 255, 255),
                 font=font_id,
-                pad_x=8,
-                pad_y=4,
+                pad_x=14,
+                pad_y=8,
             )
 
             label_text = str(det.label).strip() or "candidate"
-            label_box_w = self._text_bbox(draw, label_text, font_label)[2] + 16
-            label_box_h = self._text_bbox(draw, label_text, font_label)[3] + 10
+            label_box = self._text_bbox(draw, label_text, font_label)
+            label_w = (label_box[2] - label_box[0]) + 24
+            label_h = (label_box[3] - label_box[1]) + 14
             label_x, label_y = self._clamp_label_position(
                 img.width,
                 img.height,
-                bbox.x1 + 6,
-                bbox.y1 + 42,
-                label_box_w,
-                label_box_h,
+                cx - (label_w // 2),
+                cy + 8,
+                label_w,
+                label_h,
             )
             self._draw_badge(
                 draw,
                 label_x,
                 label_y,
                 label_text,
-                fill=(0, 0, 0, 215),
+                fill=(0, 0, 0, 220),
                 outline=color_rgba,
                 text_fill=color_rgba,
                 font=font_label,
-                pad_x=8,
-                pad_y=4,
+                pad_x=12,
+                pad_y=7,
             )
 
         return img
 
     def _draw_final_subject_preview(self, image_path: Path, chosen: Detection | None) -> Image.Image:
-        img = self._load_rgb_image(image_path)
+        scaled = [chosen] if chosen is not None else []
+        img, scaled_chosen = self._prepare_scaled_debug_image(image_path, scaled)
         draw = ImageDraw.Draw(img, "RGBA")
+        base = max(img.size)
 
         if chosen is None:
-            font = self._font(24)
+            font = self._font(max(42, int(base * 0.045)))
             text = "NO FINAL PICK"
             left, top, right, bottom = self._text_bbox(draw, text, font)
             text_w = right - left
             text_h = bottom - top
-            x = max(12, (img.width - text_w - 24) // 2)
+            x = max(12, (img.width - text_w - 36) // 2)
             y = 12
             self._draw_badge(
                 draw,
@@ -1029,128 +995,140 @@ class AICullTool:
                 outline=(255, 80, 80, 255),
                 text_fill=(255, 220, 220, 255),
                 font=font,
-                pad_x=12,
-                pad_y=8,
+                pad_x=18,
+                pad_y=10,
             )
             return img
 
+        chosen = scaled_chosen[0]
         bbox = chosen.bbox
         color = "#00FF66"
         color_rgba = self._hex_to_rgba(color, 255)
         fill_rgba = self._hex_to_rgba(color, 40)
 
-        thick = max(7, int(max(img.size) * 0.008))
+        thick = max(8, int(base * 0.010))
         draw.rectangle([bbox.x1, bbox.y1, bbox.x2, bbox.y2], fill=fill_rgba)
         draw.rectangle([bbox.x1, bbox.y1, bbox.x2, bbox.y2], outline=color_rgba, width=thick)
 
-        font = self._font(28)
+        font = self._font(max(56, int(base * 0.050)))
         text = f"FINAL PICK • ID {chosen.id}"
-        box_w = self._text_bbox(draw, text, font)[2] + 22
-        box_h = self._text_bbox(draw, text, font)[3] + 14
-        x, y = self._clamp_label_position(
+        box = self._text_bbox(draw, text, font)
+        box_w = (box[2] - box[0]) + 30
+        box_h = (box[3] - box[1]) + 20
+        cx = (bbox.x1 + bbox.x2) // 2
+        id_x, id_y = self._clamp_label_position(
             img.width,
             img.height,
-            bbox.x1 + 10,
-            bbox.y1 + 10,
+            cx - (box_w // 2),
+            bbox.y1 + 12,
             box_w,
             box_h,
         )
         self._draw_badge(
             draw,
-            x,
-            y,
+            id_x,
+            id_y,
             text,
             fill=(0, 0, 0, 235),
             outline=color_rgba,
             text_fill=(255, 255, 255, 255),
             font=font,
-            pad_x=11,
-            pad_y=7,
+            pad_x=15,
+            pad_y=10,
         )
 
         return img
 
     def _draw_shaded_candidate_image(self, image_path: Path, detections: list[Detection]) -> tuple[Path, dict[int, str], dict[str, int]]:
-        with Image.open(image_path) as img:
-            base = img.convert("RGBA")
-            overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
-            draw = ImageDraw.Draw(overlay, "RGBA")
-            font_main = self._font(24)
-            font_sub = self._font(18)
+        base_rgb, detections = self._prepare_scaled_debug_image(image_path, detections)
+        base = base_rgb.convert("RGBA")
+        overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay, "RGBA")
 
-            det_to_color: dict[int, str] = {}
-            color_to_det: dict[str, int] = {}
+        longest = max(base.size)
+        font_main = self._font(max(64, int(longest * 0.070)))
+        font_sub = self._font(max(34, int(longest * 0.035)))
 
-            line_width = max(6, int(max(base.size) * 0.007))
+        det_to_color: dict[int, str] = {}
+        color_to_det: dict[str, int] = {}
 
-            for idx, det in enumerate(detections):
-                color_name, color_hex = self.DANCE_PICK_COLORS[idx % len(self.DANCE_PICK_COLORS)]
-                det_to_color[det.id] = color_name
-                color_to_det[color_name] = det.id
+        line_width = max(10, int(longest * 0.012))
 
-                bbox = det.bbox
-                fill_rgba = self._hex_to_rgba(color_hex, 90)
-                outline_rgba = self._hex_to_rgba(color_hex, 255)
+        for idx, det in enumerate(detections):
+            color_name, color_hex = self.DANCE_PICK_COLORS[idx % len(self.DANCE_PICK_COLORS)]
+            det_to_color[det.id] = color_name
+            color_to_det[color_name] = det.id
 
-                draw.rectangle([bbox.x1, bbox.y1, bbox.x2, bbox.y2], fill=fill_rgba)
-                draw.rectangle([bbox.x1, bbox.y1, bbox.x2, bbox.y2], outline=outline_rgba, width=line_width)
+            bbox = det.bbox
+            fill_rgba = self._hex_to_rgba(color_hex, 92)
+            outline_rgba = self._hex_to_rgba(color_hex, 255)
 
-                main_text = f"ID {det.id}"
-                sub_text = color_name.upper()
+            draw.rectangle([bbox.x1, bbox.y1, bbox.x2, bbox.y2], fill=fill_rgba)
+            draw.rectangle([bbox.x1, bbox.y1, bbox.x2, bbox.y2], outline=outline_rgba, width=line_width)
 
-                main_box_w = self._text_bbox(draw, main_text, font_main)[2] + 18
-                main_box_h = self._text_bbox(draw, main_text, font_main)[3] + 10
-                main_x, main_y = self._clamp_label_position(
-                    base.width,
-                    base.height,
-                    bbox.x1 + 8,
-                    bbox.y1 + 8,
-                    main_box_w,
-                    main_box_h,
-                )
-                self._draw_badge(
-                    draw,
-                    main_x,
-                    main_y,
-                    main_text,
-                    fill=(0, 0, 0, 230),
-                    outline=outline_rgba,
-                    text_fill=(255, 255, 255, 255),
-                    font=font_main,
-                    pad_x=9,
-                    pad_y=5,
-                )
+            main_text = f"ID {det.id}"
+            sub_text = color_name.upper()
 
-                sub_box_w = self._text_bbox(draw, sub_text, font_sub)[2] + 16
-                sub_box_h = self._text_bbox(draw, sub_text, font_sub)[3] + 10
-                sub_x, sub_y = self._clamp_label_position(
-                    base.width,
-                    base.height,
-                    bbox.x1 + 8,
-                    bbox.y1 + 48,
-                    sub_box_w,
-                    sub_box_h,
-                )
-                self._draw_badge(
-                    draw,
-                    sub_x,
-                    sub_y,
-                    sub_text,
-                    fill=(0, 0, 0, 215),
-                    outline=outline_rgba,
-                    text_fill=outline_rgba,
-                    font=font_sub,
-                    pad_x=8,
-                    pad_y=4,
-                )
+            main_box = self._text_bbox(draw, main_text, font_main)
+            main_w = (main_box[2] - main_box[0]) + 34
+            main_h = (main_box[3] - main_box[1]) + 24
 
-            composed = Image.alpha_composite(base, overlay).convert("RGB")
+            sub_box = self._text_bbox(draw, sub_text, font_sub)
+            sub_w = (sub_box[2] - sub_box[0]) + 26
+            sub_h = (sub_box[3] - sub_box[1]) + 18
 
-            debug_dir = self._dance_debug_dir(image_path)
-            debug_path = debug_dir / f"{image_path.stem}_dance_vl_candidates.jpg"
-            composed.save(debug_path, format="JPEG", quality=92)
+            cx = (bbox.x1 + bbox.x2) // 2
+            cy = (bbox.y1 + bbox.y2) // 2
 
-            return debug_path, det_to_color, color_to_det
+            main_x, main_y = self._clamp_label_position(
+                base.width,
+                base.height,
+                cx - (main_w // 2),
+                cy - main_h - 8,
+                main_w,
+                main_h,
+            )
+            self._draw_badge(
+                draw,
+                main_x,
+                main_y,
+                main_text,
+                fill=(0, 0, 0, 240),
+                outline=outline_rgba,
+                text_fill=(255, 255, 255, 255),
+                font=font_main,
+                pad_x=17,
+                pad_y=12,
+            )
+
+            sub_x, sub_y = self._clamp_label_position(
+                base.width,
+                base.height,
+                cx - (sub_w // 2),
+                cy + 10,
+                sub_w,
+                sub_h,
+            )
+            self._draw_badge(
+                draw,
+                sub_x,
+                sub_y,
+                sub_text,
+                fill=(0, 0, 0, 228),
+                outline=outline_rgba,
+                text_fill=outline_rgba,
+                font=font_sub,
+                pad_x=13,
+                pad_y=9,
+            )
+
+        composed = Image.alpha_composite(base, overlay).convert("RGB")
+
+        debug_dir = self._dance_debug_dir(image_path)
+        debug_path = debug_dir / f"{image_path.stem}_dance_vl_candidates.jpg"
+        composed.save(debug_path, format="JPEG", quality=92)
+
+        return debug_path, det_to_color, color_to_det
 
     def _extract_json_object(self, text: str) -> dict:
         text = (text or "").strip()
@@ -1191,23 +1169,6 @@ class AICullTool:
         return None
 
     def _select_main_dance_detection_from_candidates(self, image_path: Path, detections: list[Detection]) -> tuple[Detection | None, str]:
-        """Use the VL model to pick the main dancer from *detections*.
-
-        Prompt rules (Req 2):
-        - Numeric detection ID is the **primary** identifier.
-        - Box overlay colour is **secondary** and must match the colour badge
-          shown on that same box — not the dancer's costume or skin.
-        - The model is instructed to set ``conflict_detected`` if the two
-          signals appear inconsistent.
-
-        Mismatch handling (Req 3):
-        - If the model returns mismatched ID/colour, an invalid ID, an invalid
-          colour, or self-reports a conflict, the result is flagged for manual
-          review, logged to ``manual_review.jsonl``, and recorded on
-          ``self.current_vl_mismatch``.
-        - Resolution priority: ID > colour > position.
-        - Mismatches are **never** silently resolved — they are always logged.
-        """
         if not detections:
             return None, "no detections"
 
@@ -1217,7 +1178,6 @@ class AICullTool:
         debug_path, det_to_color, color_to_det = self._draw_shaded_candidate_image(image_path, detections)
         self.current_vl_debug_image_path = debug_path
 
-        # Build a human-readable candidate summary for the prompt
         valid_ids = {d.id for d in detections}
         valid_colors = set(color_to_det.keys())
         candidate_lines = ", ".join(
@@ -1229,33 +1189,34 @@ class AICullTool:
         system_prompt = (
             "You are a dance recital photo subject selection assistant.\n\n"
             "The image shows shaded bounding box overlays on candidate dancer regions. "
-            "Each box has a large numeric ID badge (e.g. 'ID 1', 'ID 2') AND a colour name "
-            "badge (e.g. 'RED', 'YELLOW').\n\n"
+            "Each box has a LARGE centered numeric ID badge (e.g. 'ID 1', 'ID 2') AND a color badge "
+            "(e.g. 'RED', 'YELLOW').\n\n"
             "CRITICAL DEFINITIONS:\n"
             "- 'main_subject_detection_id' is the PRIMARY identifier. "
             "  Read the large numeric ID label directly from the image.\n"
             "- 'main_subject_color' is SECONDARY. "
-            "  It refers ONLY to the colour of the SHADED BOUNDING BOX OVERLAY — "
-            "  NOT the dancer's costume, outfit, skin tone, hair colour, or stage lighting. "
-            f"  Valid overlay colour names: {sorted(valid_colors)}.\n"
-            "- If the numeric ID and the box colour appear inconsistent, "
+            "  It refers ONLY to the color of the SHADED BOUNDING BOX OVERLAY — "
+            "  NOT the dancer's costume, outfit, skin tone, hair color, or stage lighting. "
+            f"  Valid overlay color names: {sorted(valid_colors)}.\n"
+            "- If the numeric ID and the box color appear inconsistent, "
             "  set 'conflict_detected' to true.\n\n"
             f"Candidates present: {candidate_lines}\n\n"
             "Return ONLY valid JSON with exactly these keys (no markdown, no fences):\n"
             "  main_subject_detection_id  — integer, PRIMARY: the numeric ID from the image label\n"
-            "  main_subject_color         — string, SECONDARY: the bounding box overlay colour name\n"
+            "  main_subject_color         — string, SECONDARY: the bounding box overlay color name\n"
             "  main_subject_position      — string: 'left', 'center', 'right', or ''\n"
-            "  conflict_detected          — boolean: true if ID and colour appear inconsistent\n"
+            "  conflict_detected          — boolean: true if ID and color appear inconsistent\n"
             "  reason                     — string: one short sentence\n\n"
             "Rules:\n"
             "- Choose the most visually important, clear, and cull-worthy dancer.\n"
-            "- IGNORE dancer costume colour, outfit, skin, and hair when choosing main_subject_color.\n"
+            "- IGNORE dancer costume color, outfit, skin, and hair when choosing main_subject_color.\n"
+            "- Use the large centered ID badge as your primary signal.\n"
             "- Do NOT output anything outside the JSON object.\n"
         )
 
         user_prompt = (
             "Select the single highlighted candidate that is the clearest main dance subject.\n"
-            "Use the large numeric ID label as your primary signal.\n"
+            "Use the large centered numeric ID label as your primary signal.\n"
             "Return only valid JSON."
         )
 
@@ -1282,7 +1243,6 @@ class AICullTool:
         chosen_by_position: Detection | None = None
         chosen_by_id: Detection | None = None
 
-        # Resolve each signal independently
         if chosen_color in color_to_det:
             det_id = color_to_det[chosen_color]
             chosen_by_color = next((d for d in detections if d.id == det_id), None)
@@ -1297,22 +1257,15 @@ class AICullTool:
         if chosen_id > 0:
             chosen_by_id = next((d for d in detections if d.id == chosen_id), None)
 
-        # ------------------------------------------------------------------
-        # Deterministic mismatch detection (Req 3)
-        # ------------------------------------------------------------------
         mismatches: list[str] = []
 
         invalid_id = chosen_id > 0 and chosen_id not in valid_ids
         invalid_color = bool(chosen_color) and chosen_color not in valid_colors
 
         if invalid_id:
-            mismatches.append(
-                f"invalid_id={chosen_id} (valid ids: {sorted(valid_ids)})"
-            )
+            mismatches.append(f"invalid_id={chosen_id} (valid ids: {sorted(valid_ids)})")
         if invalid_color:
-            mismatches.append(
-                f"invalid_color={chosen_color!r} (valid colors: {sorted(valid_colors)})"
-            )
+            mismatches.append(f"invalid_color={chosen_color!r} (valid colors: {sorted(valid_colors)})")
         if chosen_by_id and chosen_by_color and chosen_by_id.id != chosen_by_color.id:
             mismatches.append(
                 f"id_color_mismatch: id={chosen_id}→det{chosen_by_id.id} "
@@ -1349,19 +1302,11 @@ class AICullTool:
             mismatch_summary = "; ".join(mismatches)
             if conflict_from_vl:
                 mismatch_summary += "; VL self-reported conflict"
-            self.app.log(
-                f"AI Cull Dance VL MISMATCH — flagged for manual review: {mismatch_summary}"
-            )
+            self.app.log(f"AI Cull Dance VL MISMATCH — flagged for manual review: {mismatch_summary}")
 
-        # ------------------------------------------------------------------
-        # Resolution: ID > colour > position (ID is authoritative)
-        # ------------------------------------------------------------------
         chosen = chosen_by_id or chosen_by_color or chosen_by_position
-
         if chosen is None:
-            raise ValueError(
-                f"Could not map VL subject picker output to any candidate: {parsed}"
-            )
+            raise ValueError(f"Could not map VL subject picker output to any candidate: {parsed}")
 
         return chosen, (reason or f"Selected detection {chosen.id}")
 
@@ -1389,56 +1334,102 @@ class AICullTool:
             "burst_winner_paths": [],
         }
 
-    def _get_capture_timestamp(self, image_path: Path) -> float:
+    def _evaluate_dance_full_pipeline(self, image_path: Path, config: dict) -> dict:
+        previous_path = self.app.state.current_image_path
+        previous_image = self.app.current_image
+        previous_af = list(self.app.current_af_boxes)
+
+        self.current_vl_debug_image_path = None
+        self.current_vl_mismatch = False
+        self.current_vl_mismatch_context = None
+        self.current_vl_subject_reason = ""
+
         try:
-            with Image.open(image_path) as img:
-                exif = img.getexif()
-                if exif:
-                    exif_map = {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
-                    for key in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
-                        if key in exif_map:
-                            dt = datetime.strptime(str(exif_map[key]), "%Y:%m:%d %H:%M:%S")
-                            return dt.timestamp()
-        except Exception:
-            pass
-        return image_path.stat().st_mtime
+            self.app.load_image(Path(image_path))
 
-    def _build_bursts(self, image_paths: list[Path], fps: float) -> list[list[Path]]:
-        if not image_paths:
-            return []
-        max_gap = 1.0 / max(fps, 0.001)
+            profile = self.get_profile_data()
+            prompts = [p.strip() for p in profile.prompts if p.strip()]
+            detection_mode = config.get("detection_mode", "Phrase Only")
 
-        stamped = [(Path(p), self._get_capture_timestamp(Path(p))) for p in image_paths]
-        stamped.sort(key=lambda x: x[1])
-
-        bursts: list[list[Path]] = []
-        current = [stamped[0][0]]
-
-        for i in range(1, len(stamped)):
-            prev_t = stamped[i - 1][1]
-            cur_p, cur_t = stamped[i]
-            if (cur_t - prev_t) <= max_gap:
-                current.append(cur_p)
+            if detection_mode == "Phrase Only":
+                detections = self._get_phrase_only_detections_for_current_image(prompts)
             else:
-                bursts.append(current)
-                current = [cur_p]
-        bursts.append(current)
-        return bursts
+                detections = self._get_hybrid_detections_for_current_image(prompts)
 
-    def _rank_burst_candidates(self, items: list[dict]) -> list[dict]:
-        def key(item):
-            return (
-                self._decision_rank(item["decision"]),
-                1 if (item.get("prefer_face") and item.get("has_face")) else 0,
-                item["score"],
-                item.get("face_focus", 0.0),
-                item.get("hero_focus", 0.0),
+            people = [d for d in detections if self._is_person_label(d.label)]
+            vl_candidates = self._vl_candidate_people(people)
+            vl_candidates = vl_candidates[: len(self.DANCE_PICK_COLORS)]
+
+            chosen: Detection | None = None
+            chosen_reason = ""
+
+            if bool(config.get("use_dance_vl_subject_picker", False)) and vl_candidates:
+                chosen, chosen_reason = self._select_main_dance_detection_from_candidates(
+                    Path(image_path),
+                    vl_candidates,
+                )
+
+            img_w = self.app.current_image.width if self.app.current_image else 0
+            img_h = self.app.current_image.height if self.app.current_image else 0
+            crop_proposal, crop_center_penalty = self._compute_crop_proposal(
+                chosen, img_w, img_h, profile.main_ratio or "4:5"
             )
-        return sorted(items, key=key, reverse=True)
+
+            result = self._evaluate_dance_with_vl(Path(image_path))
+            final_score = float(result["score"]) + crop_center_penalty
+            final_decision = str(result["decision"])
+
+            rules_hash = self._dance_rules_hash()
+            cache = self._get_dance_cull_cache(Path(image_path))
+            cache_entry: dict = {
+                "image_path": str(image_path),
+                "florence_detections": [self._det_to_dict(d) for d in detections],
+                "dance_candidates": [self._det_to_dict(d) for d in vl_candidates],
+                "vl_debug_image_path": (
+                    str(self.current_vl_debug_image_path)
+                    if self.current_vl_debug_image_path else None
+                ),
+                "chosen_id": chosen.id if chosen else None,
+                "chosen_reason": chosen_reason,
+                "vl_mismatch": self.current_vl_mismatch,
+                "vl_mismatch_context": self.current_vl_mismatch_context,
+                "crop_proposal": (
+                    [crop_proposal.x1, crop_proposal.y1, crop_proposal.x2, crop_proposal.y2]
+                    if crop_proposal else None
+                ),
+                "crop_center_penalty": crop_center_penalty,
+                "vl_rubric": result.get("rubric", {}),
+                "cull_score": final_score,
+                "cull_decision": final_decision,
+            }
+            cache.put(Path(image_path), rules_hash, cache_entry)
+
+            return {
+                "path": Path(image_path),
+                "score": final_score,
+                "decision": final_decision,
+                "rubric": result.get("rubric", {}),
+                "mode": "dance_vl_full_pipeline",
+                "prefer_face": config.get("prefer_face", True),
+                "has_face": result.get("has_face", False),
+                "face_focus": 0.0,
+                "hero_focus": 0.0,
+                "burst_suppressed": False,
+                "burst_winner_paths": [],
+                "crop_center_penalty": crop_center_penalty,
+                "vl_mismatch": self.current_vl_mismatch,
+                "vl_debug_image_path": self.current_vl_debug_image_path,
+                "chosen_id": chosen.id if chosen else None,
+                "chosen_reason": chosen_reason,
+            }
+        finally:
+            self.app.state.current_image_path = previous_path
+            self.app.current_image = previous_image
+            self.app.current_af_boxes = previous_af
 
     def evaluate_image_for_pipeline(self, image_path, config: dict) -> dict:
         if str(config.get("sport_type", "")).lower() == "dance" and bool(config.get("use_dance_vl", False)):
-            return self._evaluate_dance_with_vl_pipeline(Path(image_path), config)
+            return self._evaluate_dance_full_pipeline(Path(image_path), config)
 
         previous_path = self.app.state.current_image_path
         previous_image = self.app.current_image
@@ -1465,7 +1456,6 @@ class AICullTool:
             support_ball, has_support_ball = self._pick_support_ball(hero, balls) if use_ball_scoring else (None, False)
             face_det, has_face, face_focus = self._pick_face_for_hero(hero, faces) if prefer_face else (None, False, 0.0)
 
-            # Crop-aware penalty (Req 4)
             img_w = self.app.current_image.width if self.app.current_image else 0
             img_h = self.app.current_image.height if self.app.current_image else 0
             _, crop_center_penalty = self._compute_crop_proposal(hero, img_w, img_h)
@@ -1527,75 +1517,6 @@ class AICullTool:
             self.app.current_image = previous_image
             self.app.current_af_boxes = previous_af
 
-    def _evaluate_dance_with_vl_pipeline(self, image_path: Path, config: dict) -> dict:
-        """Dance VL evaluation for the batch pipeline, with caching and crop-awareness.
-
-        Checks the disk cache before calling the VL model (Req 5), and applies a
-        crop-centre penalty to the final score (Req 4).
-        """
-        rules_hash = self._dance_rules_hash()
-        cache = self._get_dance_cull_cache(image_path)
-        cached = cache.get(image_path, rules_hash)
-
-        if cached and "cull_decision" in cached:
-            self.app.log(
-                f"AI Cull Dance: using cached result for {image_path.name} "
-                f"(decision={cached['cull_decision']} score={cached.get('cull_score', '?')})"
-            )
-            return {
-                "path": image_path,
-                "score": float(cached.get("cull_score", 0.0)),
-                "decision": str(cached["cull_decision"]),
-                "rubric": cached.get("vl_rubric", {}),
-                "mode": "dance_vl_cached",
-                "prefer_face": config.get("prefer_face", True),
-                "has_face": False,
-                "face_focus": 0.0,
-                "hero_focus": 0.0,
-                "burst_suppressed": False,
-                "burst_winner_paths": [],
-                "crop_center_penalty": cached.get("crop_center_penalty", 0.0),
-                "vl_mismatch": cached.get("vl_mismatch", False),
-            }
-
-        result = self._evaluate_dance_with_vl(image_path)
-
-        # Compute crop proposal if a chosen subject ID is available.
-        # For the pipeline path we use a simple approach: load the image to get dims.
-        crop_center_penalty = 0.0
-        chosen_id = cached.get("chosen_id") if cached else None
-        if chosen_id is not None:
-            candidate_dicts = cached.get("dance_candidates", [])
-            chosen_det = next(
-                (self._det_from_dict(d) for d in candidate_dicts if d["id"] == chosen_id),
-                None,
-            )
-            if chosen_det is not None:
-                try:
-                    with Image.open(image_path) as img:
-                        iw, ih = img.size
-                    _, crop_center_penalty = self._compute_crop_proposal(chosen_det, iw, ih)
-                except Exception:
-                    pass
-
-        result["score"] = result["score"] + crop_center_penalty
-        result["crop_center_penalty"] = crop_center_penalty
-
-        # Persist to cache
-        cache_entry: dict = {
-            "image_path": str(image_path),
-            "vl_rubric": result.get("rubric", {}),
-            "cull_score": result["score"],
-            "cull_decision": result["decision"],
-            "crop_center_penalty": crop_center_penalty,
-            "vl_mismatch": self.current_vl_mismatch,
-        }
-        if cached:
-            cache_entry = {**cached, **cache_entry}
-        cache.put(image_path, rules_hash, cache_entry)
-
-        return result
-
     def apply_burst_suppression_for_pipeline(self, results: list[dict], config: dict) -> list[dict]:
         if not results or not config.get("enable_burst", False):
             return results
@@ -1654,13 +1575,7 @@ class AICullTool:
             else:
                 detections = self._get_hybrid_detections_for_current_image(prompts)
 
-            # All person-labelled detections (includes face-labelled) — used for
-            # the manual-box display so the user can see everything Florence found.
             people = [d for d in detections if self._is_person_label(d.label)]
-
-            # VL subject-picker candidates: full-person / dancer only.
-            # Excludes face-labelled detections and boxes substantially nested
-            # inside a larger person box (Req 1).
             vl_candidates = self._vl_candidate_people(people)
             vl_candidates = vl_candidates[: len(self.DANCE_PICK_COLORS)]
 
@@ -1668,9 +1583,10 @@ class AICullTool:
 
             chosen: Detection | None = None
             chosen_reason = ""
-            original_preview = self._load_rgb_image(self.app.state.current_image_path)
-            # Florence preview uses the filtered VL candidates so what the user
-            # sees matches exactly what the model will see (Req 6).
+            original_preview = self._scale_image_to_long_edge(
+                self._load_rgb_image(self.app.state.current_image_path),
+                self.VL_TARGET_LONG_EDGE,
+            )
             florence_preview = self._draw_florence_candidates_preview(
                 self.app.state.current_image_path, vl_candidates
             )
@@ -1695,14 +1611,10 @@ class AICullTool:
                         f'reason="{chosen_reason}"'
                     )
                     if self.current_vl_debug_image_path is not None:
-                        self.app.log(
-                            f"AI Cull Dance VL debug image: {self.current_vl_debug_image_path}"
-                        )
+                        self.app.log(f"AI Cull Dance VL debug image: {self.current_vl_debug_image_path}")
                 except Exception as exc:
                     self.app.log(f"AI Cull Dance VL subject picker failed: {exc}")
 
-            # Crop-aware signal (Req 4): compute a crop proposal for the chosen
-            # subject and apply a centre-offset penalty.
             img_w = self.app.current_image.width if self.app.current_image else 0
             img_h = self.app.current_image.height if self.app.current_image else 0
             crop_proposal, crop_center_penalty = self._compute_crop_proposal(
@@ -1736,7 +1648,6 @@ class AICullTool:
                     ("Original", original_preview),
                 ])
 
-            # Persist partial results to disk cache (Req 5).
             rules_hash = self._dance_rules_hash()
             cache = self._get_dance_cull_cache(self.app.state.current_image_path)
             cache_entry: dict = {
@@ -1954,7 +1865,10 @@ class AICullTool:
         if self.stop_button is not None:
             self.stop_button.config(state="normal")
 
-        self.app.log(f"AI Cull: starting auto cull on {len(self.auto_images)} image(s)...")
+        self.app.log(
+            f"AI Cull: starting auto cull on {len(self.auto_images)} image(s) "
+            "(full per-image Florence + VL workflow, immediate save, burst suppression skipped)..."
+        )
         self.app.root.after(10, self._auto_cull_step)
 
     def _auto_cull_step(self):
@@ -1963,30 +1877,9 @@ class AICullTool:
             return
 
         if self.auto_index >= len(self.auto_images):
-            config = self.get_runtime_config()
-            self.auto_results = self.apply_burst_suppression_for_pipeline(self.auto_results, config)
-
-            keep_count = 0
-            maybe_count = 0
-            reject_count = 0
-
-            for result in self.auto_results:
-                decision = result["decision"]
-                path = Path(result["path"])
-                score = float(result.get("score", 0.0))
-
-                if decision not in ("Keep", "Maybe", "Reject"):
-                    decision = "Reject"
-
-                self._copy_image_to_decision_folder(path, decision, score)
-
-                if decision == "Keep":
-                    keep_count += 1
-                elif decision == "Maybe":
-                    maybe_count += 1
-                else:
-                    reject_count += 1
-
+            keep_count = sum(1 for r in self.auto_results if r.get("decision") == "Keep")
+            maybe_count = sum(1 for r in self.auto_results if r.get("decision") == "Maybe")
+            reject_count = sum(1 for r in self.auto_results if r.get("decision") == "Reject")
             self.app.log(
                 f"AI Cull: complete. Keep={keep_count}, Maybe={maybe_count}, Reject={reject_count}"
             )
@@ -1998,11 +1891,22 @@ class AICullTool:
         self.app.load_current_image()
 
         try:
-            result = self.evaluate_image_for_pipeline(image_path, self.get_runtime_config())
+            config = self.get_runtime_config()
+            config["enable_burst"] = False
+
+            result = self.evaluate_image_for_pipeline(image_path, config)
             self.auto_results.append(result)
+
+            decision = result.get("decision", "Reject")
+            if decision not in ("Keep", "Maybe", "Reject"):
+                decision = "Reject"
+            score = float(result.get("score", 0.0))
+
+            self._copy_image_to_decision_folder(Path(image_path), decision, score)
+
             self.app.log(
                 f"AI Cull Auto {self.auto_index + 1}/{len(self.auto_images)}: "
-                f"{image_path.name} -> {result['decision']} score={result['score']:.1f}"
+                f"{image_path.name} -> {decision} score={score:.1f}"
             )
         except Exception as exc:
             self.app.log(f"AI Cull: failed on {image_path.name}: {exc}")

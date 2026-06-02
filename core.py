@@ -91,19 +91,27 @@ def run_florence_phrase_detection(image, phrase: str) -> list[Detection]:
             raw_bboxes = result.get("bboxes", []) or []
 
     detections: list[Detection] = []
-    for i, bbox in enumerate(raw_bboxes, start=1):
-        x1, y1, x2, y2 = map(int, bbox)
+    next_id = 1
+    for bbox in raw_bboxes:
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        try:
+            x1, y1, x2, y2 = [int(round(float(v))) for v in bbox]
+        except Exception:
+            continue
         if x2 <= x1 or y2 <= y1:
             continue
         detections.append(
             Detection(
-                id=i,
+                id=next_id,
                 label=phrase,
                 bbox=BoundingBox(x1, y1, x2, y2),
                 color="#00BFFF",
-                source=f"phrase:{phrase}",
+                source="florence_phrase",
             )
         )
+        next_id += 1
+
     return detections
 
 
@@ -144,130 +152,29 @@ def run_florence_od_detection(image) -> list[Detection]:
             raw_bboxes = result.get("bboxes", []) or []
             raw_labels = result.get("labels", []) or []
 
-    while len(raw_labels) < len(raw_bboxes):
-        raw_labels.append("object")
-
     detections: list[Detection] = []
-    for i, (bbox, label) in enumerate(zip(raw_bboxes, raw_labels), start=1):
-        x1, y1, x2, y2 = map(int, bbox)
+    next_id = 1
+    for bbox, label in zip(raw_bboxes, raw_labels):
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        try:
+            x1, y1, x2, y2 = [int(round(float(v))) for v in bbox]
+        except Exception:
+            continue
         if x2 <= x1 or y2 <= y1:
             continue
         detections.append(
             Detection(
-                id=i,
-                label=str(label).strip() or "object",
+                id=next_id,
+                label=str(label),
                 bbox=BoundingBox(x1, y1, x2, y2),
-                color="#7FD1FF",
-                source="od",
+                color="#00BFFF",
+                source="florence_od",
             )
         )
+        next_id += 1
+
     return detections
-
-
-def parse_to_float_list(val):
-    if isinstance(val, (int, float)):
-        return [float(val)]
-    if isinstance(val, str):
-        nums = re.findall(r"-?\d+\.?\d*", val)
-        return [float(n) for n in nums]
-    if isinstance(val, list):
-        out = []
-        for v in val:
-            try:
-                out.append(float(v))
-            except Exception:
-                pass
-        return out
-    return []
-
-
-def get_af_points_and_boxes(file_path: Path):
-    try:
-        cmd = [
-            "exiftool",
-            "-j",
-            "-AF*",
-            "-AFArea*",
-            "-AFPointsInFocus",
-            "-AFAreaXPositions",
-            "-AFAreaYPositions",
-            "-AFAreaWidths",
-            "-AFAreaHeights",
-            "-ImageWidth",
-            "-ImageHeight",
-            str(file_path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        payload = json.loads(result.stdout)[0] if result.stdout.strip() else {}
-    except FileNotFoundError:
-        return [], []
-    except Exception:
-        return [], []
-
-    af_in_focus = parse_to_float_list(payload.get("AFPointsInFocus"))
-    af_x = parse_to_float_list(payload.get("AFAreaXPositions"))
-    af_y = parse_to_float_list(payload.get("AFAreaYPositions"))
-    af_w = parse_to_float_list(payload.get("AFAreaWidths"))
-    af_h = parse_to_float_list(payload.get("AFAreaHeights"))
-
-    try:
-        img_w = int(payload.get("ImageWidth") or 0)
-        img_h = int(payload.get("ImageHeight") or 0)
-    except Exception:
-        img_w, img_h = 0, 0
-
-    if not img_w or not img_h:
-        try:
-            with Image.open(file_path) as dim_img:
-                img_w, img_h = dim_img.size
-        except Exception:
-            return [], []
-
-    points = []
-    boxes = []
-
-    for point_idx_float in af_in_focus:
-        point_idx = int(point_idx_float)
-        if point_idx < len(af_x) and point_idx < len(af_y):
-            x = af_x[point_idx]
-            y = af_y[point_idx]
-            w = af_w[point_idx] if point_idx < len(af_w) else 56.0
-            h = af_h[point_idx] if point_idx < len(af_h) else 56.0
-            cx = (img_w / 2.0) + x
-            cy = (img_h / 2.0) + y
-            box = BoundingBox(
-                int(round(cx - (w / 2.0))),
-                int(round(cy - (h / 2.0))),
-                int(round(cx + (w / 2.0))),
-                int(round(cy + (h / 2.0))),
-            )
-            points.append((cx, cy))
-            boxes.append(box)
-
-    return points, boxes
-
-
-def get_focus_score(image, box: BoundingBox) -> float:
-    rgb = np.array(image)
-    cv_img = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-
-    x1 = max(0, int(box.x1))
-    y1 = max(0, int(box.y1))
-    x2 = min(cv_img.shape[1], int(box.x2))
-    y2 = min(cv_img.shape[0], int(box.y2))
-
-    if x2 <= x1 or y2 <= y1:
-        return 0.0
-
-    face_region_y2 = y1 + int((y2 - y1) * 0.35)
-    face_region_y2 = max(y1 + 1, min(face_region_y2, y2))
-
-    crop = cv_img[y1:face_region_y2, x1:x2]
-    if crop.size == 0:
-        return 0.0
-
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
 def parse_ratio(ratio_str: str) -> float:
@@ -338,6 +245,29 @@ def union_boxes(boxes: list[BoundingBox]) -> BoundingBox | None:
     )
 
 
+def clamp_margin_pct_to_image_edges(
+    subject_box: BoundingBox,
+    img_w: int,
+    img_h: int,
+    margin_pct: float,
+) -> float:
+    margin_pct = max(0.0, float(margin_pct))
+
+    box_w = max(1.0, float(subject_box.width))
+    box_h = max(1.0, float(subject_box.height))
+
+    left_room = max(0.0, float(subject_box.x1))
+    right_room = max(0.0, float(img_w - subject_box.x2))
+    top_room = max(0.0, float(subject_box.y1))
+    bottom_room = max(0.0, float(img_h - subject_box.y2))
+
+    max_x_margin_pct = min(left_room, right_room) / box_w * 100.0
+    max_y_margin_pct = min(top_room, bottom_room) / box_h * 100.0
+
+    safe_margin_pct = min(margin_pct, max_x_margin_pct, max_y_margin_pct)
+    return max(0.0, safe_margin_pct)
+
+
 def expand_box(box: BoundingBox, img_w: int, img_h: int, margin_pct: float) -> BoundingBox:
     margin = max(0.0, margin_pct) / 100.0
     x_pad = box.width * margin
@@ -377,8 +307,63 @@ def fit_box_to_ratio(box: BoundingBox, img_w: int, img_h: int, ratio_str: str) -
 
 
 def build_crop_around_subject(subject_box: BoundingBox, img_w: int, img_h: int, ratio_str: str, margin_pct: float) -> BoundingBox:
-    expanded = expand_box(subject_box, img_w, img_h, margin_pct)
-    return fit_box_to_ratio(expanded, img_w, img_h, ratio_str)
+    effective_margin_pct = clamp_margin_pct_to_image_edges(
+        subject_box=subject_box,
+        img_w=img_w,
+        img_h=img_h,
+        margin_pct=margin_pct,
+    )
+
+    expanded = expand_box(subject_box, img_w, img_h, effective_margin_pct)
+
+    ratio = parse_ratio(ratio_str)
+    subject_cx = (subject_box.x1 + subject_box.x2) / 2.0
+    subject_cy = (subject_box.y1 + subject_box.y2) / 2.0
+
+    max_left = subject_cx
+    max_right = img_w - subject_cx
+    max_up = subject_cy
+    max_down = img_h - subject_cy
+
+    max_half_w = min(max_left, max_right)
+    max_half_h = min(max_up, max_down)
+
+    req_half_w = max(1.0, expanded.width / 2.0)
+    req_half_h = max(1.0, expanded.height / 2.0)
+
+    half_w = req_half_w
+    half_h = half_w / ratio
+
+    if half_h < req_half_h:
+        half_h = req_half_h
+        half_w = half_h * ratio
+
+    max_half_w_by_h = max_half_h * ratio
+    max_half_h_by_w = max_half_w / ratio
+
+    if half_w > max_half_w:
+        half_w = max_half_w
+        half_h = half_w / ratio
+
+    if half_h > max_half_h:
+        half_h = max_half_h
+        half_w = half_h * ratio
+
+    if half_h < req_half_h:
+        half_h = min(max_half_h, req_half_h)
+        half_w = min(max_half_w, half_h * ratio)
+
+    if half_w < req_half_w:
+        half_w = min(max_half_w, req_half_w)
+        half_h = min(max_half_h, half_w / ratio)
+
+    x1 = int(round(subject_cx - half_w))
+    y1 = int(round(subject_cy - half_h))
+    x2 = int(round(subject_cx + half_w))
+    y2 = int(round(subject_cy + half_h))
+
+    centered = BoundingBox(x1, y1, x2, y2)
+    return shift_box_to_fit(centered, img_w, img_h)
 
 
 def compute_iou(box1: BoundingBox, box2: BoundingBox) -> float:
@@ -390,9 +375,116 @@ def compute_iou(box1: BoundingBox, box2: BoundingBox) -> float:
     inter_w = max(0, x2 - x1)
     inter_h = max(0, y2 - y1)
     inter_area = inter_w * inter_h
-    if inter_area == 0:
-        return 0.0
 
     area1 = box1.width * box1.height
     area2 = box2.width * box2.height
-    return inter_area / float(area1 + area2 - inter_area)
+    union_area = area1 + area2 - inter_area
+
+    if union_area <= 0:
+        return 0.0
+    return inter_area / union_area
+
+
+def get_focus_score(image, bbox: BoundingBox) -> float:
+    try:
+        arr = np.array(image)
+        if arr.size == 0:
+            return 0.0
+
+        h, w = arr.shape[:2]
+        x1 = max(0, min(w, bbox.x1))
+        y1 = max(0, min(h, bbox.y1))
+        x2 = max(0, min(w, bbox.x2))
+        y2 = max(0, min(h, bbox.y2))
+
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+
+        roi = arr[y1:y2, x1:x2]
+        if roi.size == 0:
+            return 0.0
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    except Exception:
+        return 0.0
+
+
+def get_af_points_and_boxes(image_path: Path):
+    image_path = Path(image_path)
+    sidecar = image_path.with_suffix(".json")
+
+    af_points = []
+    af_boxes = []
+
+    if sidecar.exists():
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+
+            for pt in data.get("af_points", []):
+                if isinstance(pt, dict):
+                    x = int(pt.get("x", 0))
+                    y = int(pt.get("y", 0))
+                    af_points.append((x, y))
+                elif isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                    af_points.append((int(pt[0]), int(pt[1])))
+
+            for box in data.get("af_boxes", []):
+                if isinstance(box, dict):
+                    af_boxes.append(
+                        BoundingBox(
+                            int(box.get("x1", 0)),
+                            int(box.get("y1", 0)),
+                            int(box.get("x2", 0)),
+                            int(box.get("y2", 0)),
+                        )
+                    )
+                elif isinstance(box, (list, tuple)) and len(box) >= 4:
+                    af_boxes.append(
+                        BoundingBox(
+                            int(box[0]),
+                            int(box[1]),
+                            int(box[2]),
+                            int(box[3]),
+                        )
+                    )
+        except Exception:
+            pass
+
+    if af_points or af_boxes:
+        return af_points, af_boxes
+
+    try:
+        exiftool = "exiftool"
+        result = subprocess.run(
+            [exiftool, "-j", str(image_path)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return [], []
+
+        payload = json.loads(result.stdout)
+        if not isinstance(payload, list) or not payload:
+            return [], []
+
+        data = payload[0]
+
+        for key, value in data.items():
+            key_lower = key.lower()
+
+            if "af" in key_lower and "point" in key_lower and isinstance(value, str):
+                matches = re.findall(r"(-?\d+)\s*,\s*(-?\d+)", value)
+                for x, y in matches:
+                    af_points.append((int(x), int(y)))
+
+            if "af" in key_lower and "box" in key_lower and isinstance(value, str):
+                matches = re.findall(r"(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)", value)
+                for x1, y1, x2, y2 in matches:
+                    af_boxes.append(BoundingBox(int(x1), int(y1), int(x2), int(y2)))
+
+    except Exception:
+        pass
+
+    return af_points, af_boxes
