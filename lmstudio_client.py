@@ -220,12 +220,15 @@ class LMStudioClient:
         if not frames:
             raise ValueError("No burst frames were provided.")
 
-        emphasis = (
-            "Prioritize the cleanest dance recital delivery frame: sharp subject, flattering pose, usable face angle, "
-            "full-body visibility, and uncropped feet/hands when possible."
-            if str(rubric_name).strip().lower() == "dance"
-            else "Prioritize the strongest keeper frame: sharpness, expression, moment, subject visibility, and clean composition."
-        )
+        if str(rubric_name).strip().lower() == "dance":
+            emphasis = (
+                "Prioritize the cleanest dance recital delivery frame: sharp subject, flattering pose, usable face angle, "
+                "full-body visibility, and uncropped feet/hands when possible."
+            )
+        else:
+            emphasis = (
+                "Prioritize the strongest keeper frame: sharpness, expression, moment, subject visibility, and clean composition."
+            )
 
         system_prompt = (
             "You are comparing near-duplicate frames from the same sports photo burst.\n"

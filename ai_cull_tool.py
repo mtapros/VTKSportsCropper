@@ -1723,6 +1723,7 @@ class AICullTool:
             burst_results = [path_to_result[p] for p in burst_paths if p in path_to_result]
             if not burst_results:
                 continue
+            burst_label = Path(burst_results[0]["path"]).name
             ranked = self._rank_burst_candidates(burst_results)
             burst_selection: dict | None = None
             burst_selection_source = "heuristic"
@@ -1732,13 +1733,10 @@ class AICullTool:
                     burst_selection_source = "vl"
                     best_frame = str(burst_selection.get("best_frame", "")).strip()
                     self.app.log(
-                        f"AI Cull burst VL selector chose {best_frame or 'top frame'} "
-                        f"for burst starting at {Path(burst_results[0]['path']).name}"
+                        f"AI Cull burst VL selector chose {best_frame or 'top frame'} for burst starting at {burst_label}"
                     )
                 except Exception as exc:
-                    self.app.log(
-                        f"AI Cull burst VL selector failed for {Path(burst_results[0]['path']).name}: {exc}"
-                    )
+                    self.app.log(f"AI Cull burst VL selector failed for {burst_label}: {exc}")
             winners = ranked[:keep_per_burst]
             winner_paths: list[Path] = []
             winner_path_set: set[Path] = set()
