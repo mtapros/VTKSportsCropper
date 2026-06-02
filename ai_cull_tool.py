@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import math
 import shutil
@@ -1320,21 +1321,20 @@ class AICullTool:
         profile = self.get_profile_data()
         rubric_name = getattr(profile, "vl_rubric_name", "generic")
         if hasattr(client, "generic_cull_rubric"):
+            generic_cull = client.generic_cull_rubric
+            generic_kwargs = {
+                "model": model,
+                "image_path": image_path,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
             try:
-                rubric = client.generic_cull_rubric(
-                    model=model,
-                    image_path=image_path,
-                    rubric_name=rubric_name,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-            except TypeError:
-                rubric = client.generic_cull_rubric(
-                    model=model,
-                    image_path=image_path,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
+                params = inspect.signature(generic_cull).parameters
+                if "rubric_name" in params:
+                    generic_kwargs["rubric_name"] = rubric_name
+            except (TypeError, ValueError):
+                pass
+            rubric = generic_cull(**generic_kwargs)
         else:
             rubric = client.dance_cull_rubric(
                 model=model,
