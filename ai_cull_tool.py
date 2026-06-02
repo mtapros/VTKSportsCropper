@@ -111,6 +111,7 @@ class AICullTool:
         self.burst_fps_var = tk.StringVar(value="8")
         self.keep_per_burst_var = tk.StringVar(value="1")
         self.use_vl_burst_tiebreaker_var = tk.BooleanVar(value=False)
+        self.hide_burst_suppressed_var = tk.BooleanVar(value=True)
         self.prefer_face_var = tk.BooleanVar(value=True)
 
         self.use_dance_vl_var = tk.BooleanVar(value=True)
@@ -133,7 +134,9 @@ class AICullTool:
         self.auto_images: list[Path] = []
         self.auto_results: list[dict] = []
         self.auto_index = 0
+        self.auto_mode = "auto_cull"
         self.auto_button = None
+        self.burst_button = None
         self.stop_button = None
 
         self.dance_frame = None
@@ -219,6 +222,16 @@ class AICullTool:
 
         tk.Checkbutton(
             self.panel,
+            text="Hide Burst-Suppressed Images",
+            variable=self.hide_burst_suppressed_var,
+            command=self.refresh_burst_browser_view,
+            bg="#2a2a2a",
+            fg="white",
+            selectcolor="#444",
+        ).pack(anchor="w", **pad)
+
+        tk.Checkbutton(
+            self.panel,
             text="Prefer Visible Face",
             variable=self.prefer_face_var,
             bg="#2a2a2a",
@@ -276,12 +289,19 @@ class AICullTool:
         tk.Button(self.panel, text="Rerun AI Cull", command=self.rerun).pack(fill="x", padx=10, pady=(10, 4))
         tk.Button(self.panel, text="Approve Keep/Maybe", command=self.approve).pack(fill="x", padx=10, pady=(0, 4))
 
+        self.burst_button = tk.Button(
+            self.panel,
+            text="Run Burst Suppression",
+            command=self.run_burst_suppression_input_folder,
+        )
+        self.burst_button.pack(fill="x", padx=10, pady=(0, 4))
+
         self.auto_button = tk.Button(self.panel, text="Auto Cull Input Folder", command=self.auto_cull_input_folder)
         self.auto_button.pack(fill="x", padx=10, pady=(0, 4))
 
         self.stop_button = tk.Button(
             self.panel,
-            text="Stop Auto Cull",
+            text="Stop Current Operation",
             command=self.stop_auto_cull,
             state="disabled",
             bg="#8b1e1e",
@@ -426,6 +446,82 @@ class AICullTool:
     def _get_dance_cull_cache(self, image_path: Path) -> DanceCullCache:
         folder = self.app.state.input_folder or image_path.parent
         return DanceCullCache(Path(folder))
+
+    def _get_cached_entry(self, image_path: Path, rules_hash: str | None = None) -> dict:
+        try:
+            entry = self._get_dance_cull_cache(image_path).get(image_path, rules_hash or self._dance_rules_hash())
+        except Exception:
+            entry = None
+        return dict(entry) if isinstance(entry, dict) else {}
+
+    def _put_cached_entry(self, image_path: Path, updates: dict, rules_hash: str | None = None) -> dict:
+        active_rules_hash = rules_hash or self._dance_rules_hash()
+        cache = self._get_dance_cull_cache(image_path)
+        merged = self._get_cached_entry(image_path, active_rules_hash)
+        merged.update(updates)
+        merged["image_path"] = str(image_path)
+        cache.put(image_path, active_rules_hash, merged)
+        return merged
+
+    def _get_burst_cache_entry(self, image_path: Path) -> dict:
+        entry = self._get_cached_entry(image_path)
+        if "burst_group_id" not in entry and "burst_suppressed" not in entry:
+            return {}
+        return entry
+
+    def get_folder_browser_state(self, ordered_paths: list[Path]) -> tuple[list[Path], list[str]]:
+        visible_paths: list[Path] = []
+        labels: list[str] = []
+        hide_suppressed = bool(self.hide_burst_suppressed_var.get())
+
+        for raw_path in ordered_paths:
+            path = Path(raw_path)
+            burst_entry = self._get_burst_cache_entry(path)
+            is_suppressed = bool(burst_entry.get("burst_suppressed", False))
+            label = path.name
+            if is_suppressed:
+                label = f"{path.name} [Burst Suppressed]"
+            elif int(burst_entry.get("burst_size", 1)) > 1:
+                label = f"{path.name} [Burst Kept]"
+
+            if is_suppressed and hide_suppressed:
+                continue
+
+            visible_paths.append(path)
+            labels.append(label)
+
+        if not visible_paths and ordered_paths:
+            return list(ordered_paths), [Path(p).name for p in ordered_paths]
+        return visible_paths, labels
+
+    def refresh_burst_browser_view(self):
+        if self.app.state.input_folder is None:
+            return
+        self.app.refresh_image_browser()
+
+    def _log_current_burst_state(self):
+        image_path = self.app.state.current_image_path
+        if image_path is None:
+            return
+
+        burst_entry = self._get_burst_cache_entry(Path(image_path))
+        burst_size = int(burst_entry.get("burst_size", 1))
+        if burst_size <= 1:
+            return
+
+        burst_rank = int(burst_entry.get("burst_rank", 0))
+        burst_group_id = str(burst_entry.get("burst_group_id", "burst"))
+        if bool(burst_entry.get("burst_suppressed", False)):
+            winners = [Path(p).name for p in burst_entry.get("burst_winner_paths", []) if p]
+            self.app.log(
+                f"AI Cull Burst: {Path(image_path).name} suppressed in {burst_group_id} "
+                f"(rank {burst_rank}/{burst_size}; kept: {', '.join(winners) or 'none'})."
+            )
+        else:
+            self.app.log(
+                f"AI Cull Burst: {Path(image_path).name} kept in {burst_group_id} "
+                f"(rank {burst_rank}/{burst_size})."
+            )
 
     @staticmethod
     def _det_to_dict(det: Detection) -> dict:
@@ -1416,7 +1512,6 @@ class AICullTool:
             final_decision = str(result["decision"])
 
             rules_hash = self._dance_rules_hash()
-            cache = self._get_dance_cull_cache(Path(image_path))
             cache_entry: dict = {
                 "image_path": str(image_path),
                 "florence_detections": [self._det_to_dict(d) for d in detections],
@@ -1438,7 +1533,7 @@ class AICullTool:
                 "cull_score": final_score,
                 "cull_decision": final_decision,
             }
-            cache.put(Path(image_path), rules_hash, cache_entry)
+            self._put_cached_entry(Path(image_path), cache_entry, rules_hash)
 
             return {
                 "path": Path(image_path),
@@ -1779,18 +1874,23 @@ class AICullTool:
         bursts = self._build_bursts(ordered_paths, float(config.get("burst_fps", 8.0)))
         keep_per_burst = max(1, int(config.get("keep_per_burst", 1)))
 
-        for burst_paths in bursts:
+        for burst_index, burst_paths in enumerate(bursts, start=1):
             burst_results = [path_to_result[p] for p in burst_paths if p in path_to_result]
             ranked = self._rank_burst_candidates(burst_results)
             winners, vl_meta = self._select_burst_winners_with_vl(ranked, keep_per_burst, config)
             if not winners:
                 winners = ranked[:keep_per_burst]
             winner_paths = {Path(item["path"]) for item in winners}
+            winner_path_strings = [str(p) for p in sorted(winner_paths, key=lambda p: p.name.lower())]
             vl_used = bool(vl_meta) and "error" not in vl_meta
+            group_id = f"burst_{burst_index:04d}"
+            rank_by_path = {Path(item["path"]): rank for rank, item in enumerate(ranked, start=1)}
 
             for item in burst_results:
                 item["burst_size"] = len(burst_results)
-                item["burst_winner_paths"] = [str(p) for p in winner_paths]
+                item["burst_group_id"] = group_id
+                item["burst_rank"] = rank_by_path.get(Path(item["path"]), 0)
+                item["burst_winner_paths"] = winner_path_strings
                 item["burst_vl_selector_used"] = vl_used
                 if vl_meta:
                     item["burst_vl_selector"] = vl_meta
@@ -1801,6 +1901,61 @@ class AICullTool:
                     item["burst_suppressed"] = False
 
         return results
+
+    def _persist_burst_suppression_results(self, results: list[dict]) -> None:
+        for item in results:
+            image_path = Path(item["path"])
+            burst_updates = {
+                "burst_group_id": item.get("burst_group_id"),
+                "burst_rank": int(item.get("burst_rank", 0)),
+                "burst_size": int(item.get("burst_size", 1)),
+                "burst_suppressed": bool(item.get("burst_suppressed", False)),
+                "burst_winner_paths": [str(p) for p in item.get("burst_winner_paths", []) or []],
+                "burst_vl_selector_used": bool(item.get("burst_vl_selector_used", False)),
+            }
+            if item.get("burst_vl_selector"):
+                burst_updates["burst_vl_selector"] = dict(item.get("burst_vl_selector", {}))
+            self._put_cached_entry(image_path, burst_updates)
+
+    def _folder_batch_source_paths(self) -> list[Path]:
+        return [Path(p) for p in (self.app.state.all_image_paths or self.app.state.image_paths)]
+
+    def run_burst_suppression_input_folder(self):
+        if self.auto_running:
+            self.app.log("AI Cull: another batch job is already running.")
+            return
+
+        if self.app.state.input_folder is None:
+            self.app.log("AI Cull: please select an input folder first.")
+            return
+
+        if not (self.app.state.all_image_paths or self.app.state.image_paths):
+            self.app.log("AI Cull: loading images from input folder...")
+            self.app.start_batch()
+
+        self.auto_images = self._folder_batch_source_paths()
+        if not self.auto_images:
+            self.app.log("AI Cull: no images found in input folder.")
+            return
+
+        self.auto_results = []
+        self.auto_index = 0
+        self.auto_mode = "burst_suppression"
+        self.auto_running = True
+        self.auto_cancel_requested = False
+
+        if self.auto_button is not None:
+            self.auto_button.config(state="disabled")
+        if self.burst_button is not None:
+            self.burst_button.config(state="disabled")
+        if self.stop_button is not None:
+            self.stop_button.config(state="normal")
+
+        self.app.log(
+            f"AI Cull Burst Suppression: starting folder-wide pass on {len(self.auto_images)} image(s) "
+            "(heuristic burst grouping first; VL tie-breaker only inside grouped bursts when enabled)."
+        )
+        self.app.root.after(10, self._auto_cull_step)
 
     def on_image_changed(self):
         self.current_score = 0.0
@@ -1823,6 +1978,7 @@ class AICullTool:
             return
 
         runtime_config = self.get_runtime_config()
+        self._log_current_burst_state()
 
         if str(runtime_config.get("sport_type", "")).lower() == "dance" or bool(runtime_config.get("use_dance_vl", False)):
             profile = self.get_profile_data()
@@ -1908,7 +2064,6 @@ class AICullTool:
                 ])
 
             rules_hash = self._dance_rules_hash()
-            cache = self._get_dance_cull_cache(self.app.state.current_image_path)
             cache_entry: dict = {
                 "image_path": str(self.app.state.current_image_path),
                 "florence_detections": [self._det_to_dict(d) for d in detections],
@@ -1944,12 +2099,12 @@ class AICullTool:
                     cache_entry["cull_score"] = self.current_score
                     cache_entry["cull_decision"] = self.current_decision
                     cache_entry["vl_rubric"] = self.current_vl_rubric
-                    cache.put(self.app.state.current_image_path, rules_hash, cache_entry)
+                    self._put_cached_entry(self.app.state.current_image_path, cache_entry, rules_hash)
                     return
                 except Exception as exc:
                     self.app.log(f"AI Cull Dance VL failed, falling back to heuristic cull: {exc}")
 
-            cache.put(self.app.state.current_image_path, rules_hash, cache_entry)
+            self._put_cached_entry(self.app.state.current_image_path, cache_entry, rules_hash)
 
         profile = self.get_profile_data()
         prompts = [p.strip() for p in profile.prompts if p.strip()]
@@ -2094,7 +2249,7 @@ class AICullTool:
         if not self.auto_running:
             return
         self.auto_cancel_requested = True
-        self.app.log("AI Cull: stop requested...")
+        self.app.log(f"AI Cull: stop requested for {self.auto_mode.replace('_', ' ')}...")
 
     def auto_cull_input_folder(self):
         if self.auto_running:
@@ -2116,17 +2271,22 @@ class AICullTool:
 
         self.auto_results = []
         self.auto_index = 0
+        self.auto_mode = "auto_cull"
         self.auto_running = True
         self.auto_cancel_requested = False
 
         if self.auto_button is not None:
             self.auto_button.config(state="disabled")
+        if self.burst_button is not None:
+            self.burst_button.config(state="disabled")
         if self.stop_button is not None:
             self.stop_button.config(state="normal")
 
+        total_folder_images = len(self._folder_batch_source_paths())
         self.app.log(
             f"AI Cull: starting auto cull on {len(self.auto_images)} image(s) "
-            "(full per-image Florence + VL workflow, immediate save, burst suppression skipped)..."
+            f"(current browser set; folder total={total_folder_images}. "
+            "Run Burst Suppression first to reduce duplicates up front.)"
         )
         self.app.root.after(10, self._auto_cull_step)
 
@@ -2136,6 +2296,28 @@ class AICullTool:
             return
 
         if self.auto_index >= len(self.auto_images):
+            if self.auto_mode == "burst_suppression":
+                config = self.get_runtime_config()
+                config["enable_burst"] = True
+                suppressed_results = self.apply_burst_suppression_for_pipeline(self.auto_results, config)
+                self._persist_burst_suppression_results(suppressed_results)
+                self.app.refresh_image_browser()
+
+                burst_group_ids = {
+                    str(item.get("burst_group_id", ""))
+                    for item in suppressed_results
+                    if int(item.get("burst_size", 1)) > 1
+                }
+                kept_count = sum(1 for r in suppressed_results if not r.get("burst_suppressed", False))
+                suppressed_count = sum(1 for r in suppressed_results if r.get("burst_suppressed", False))
+                self.app.log(
+                    f"AI Cull Burst Suppression: complete. "
+                    f"Bursts={len([g for g in burst_group_ids if g])}, "
+                    f"kept={kept_count}, suppressed={suppressed_count}"
+                )
+                self._finish_auto_cull(cancelled=False)
+                return
+
             keep_count = sum(1 for r in self.auto_results if r.get("decision") == "Keep")
             maybe_count = sum(1 for r in self.auto_results if r.get("decision") == "Maybe")
             reject_count = sum(1 for r in self.auto_results if r.get("decision") == "Reject")
@@ -2146,27 +2328,30 @@ class AICullTool:
             return
 
         image_path = self.auto_images[self.auto_index]
-        self.app.state.current_index = self.auto_index
-        self.app.load_current_image()
-
         try:
             config = self.get_runtime_config()
-            config["enable_burst"] = False
-
+            if self.auto_mode != "burst_suppression":
+                self.app.state.current_index = self.auto_index
+                self.app.load_current_image()
             result = self.evaluate_image_for_pipeline(image_path, config)
             self.auto_results.append(result)
+            if self.auto_mode == "burst_suppression":
+                self.app.log(
+                    f"AI Cull Burst {self.auto_index + 1}/{len(self.auto_images)}: "
+                    f"{image_path.name} analyzed score={float(result.get('score', 0.0)):.1f}"
+                )
+            else:
+                decision = result.get("decision", "Reject")
+                if decision not in ("Keep", "Maybe", "Reject"):
+                    decision = "Reject"
+                score = float(result.get("score", 0.0))
 
-            decision = result.get("decision", "Reject")
-            if decision not in ("Keep", "Maybe", "Reject"):
-                decision = "Reject"
-            score = float(result.get("score", 0.0))
+                self._copy_image_to_decision_folder(Path(image_path), decision, score)
 
-            self._copy_image_to_decision_folder(Path(image_path), decision, score)
-
-            self.app.log(
-                f"AI Cull Auto {self.auto_index + 1}/{len(self.auto_images)}: "
-                f"{image_path.name} -> {decision} score={score:.1f}"
-            )
+                self.app.log(
+                    f"AI Cull Auto {self.auto_index + 1}/{len(self.auto_images)}: "
+                    f"{image_path.name} -> {decision} score={score:.1f}"
+                )
         except Exception as exc:
             self.app.log(f"AI Cull: failed on {image_path.name}: {exc}")
 
@@ -2176,14 +2361,17 @@ class AICullTool:
     def _finish_auto_cull(self, cancelled: bool):
         self.auto_running = False
         self.auto_cancel_requested = False
+        self.auto_mode = "auto_cull"
 
         if self.auto_button is not None:
             self.auto_button.config(state="normal")
+        if self.burst_button is not None:
+            self.burst_button.config(state="normal")
         if self.stop_button is not None:
             self.stop_button.config(state="disabled")
 
         if cancelled:
-            self.app.log("AI Cull: auto cull cancelled.")
+            self.app.log("AI Cull: batch job cancelled.")
 
     def approve(self):
         if self.app.state.current_image_path is None:
