@@ -843,13 +843,17 @@ class AICullTool:
         next_score = float(candidates[keep_per_burst].get("score", 0.0))
         return (top_score - next_score) <= self.BURST_VL_SCORE_GAP
 
+    def _resolve_burst_rubric_name(self, profile: SportProfile) -> str:
+        rubric_name = getattr(profile, "vl_rubric_name", "generic")
+        if str(getattr(profile, "sport_type", "")).strip().lower() == "dance" and str(rubric_name).strip().lower() == "generic":
+            return "dance"
+        return rubric_name
+
     def _select_burst_winners_with_vl(self, ranked: list[dict], keep_per_burst: int) -> tuple[list[dict], dict]:
         base_url, model, timeout, temperature, max_tokens = self._dance_lmstudio_settings()
         client = LMStudioClient(base_url=base_url, timeout=timeout)
         profile = self.get_profile_data()
-        rubric_name = getattr(profile, "vl_rubric_name", "generic")
-        if str(getattr(profile, "sport_type", "")).strip().lower() == "dance" and str(rubric_name).strip().lower() == "generic":
-            rubric_name = "dance"
+        rubric_name = self._resolve_burst_rubric_name(profile)
         candidates = self._get_vl_burst_candidates(ranked, keep_per_burst)
         frame_map: dict[str, dict] = {}
         frames: list[dict] = []
@@ -1743,14 +1747,8 @@ class AICullTool:
                 except Exception as exc:
                     self.app.log(f"AI Cull burst VL selector failed for {burst_label}: {exc}")
             winners = ranked[:keep_per_burst]
-            winner_paths: list[Path] = []
-            winner_path_set: set[Path] = set()
-            for item in winners:
-                winner_path = Path(item["path"])
-                if winner_path in winner_path_set:
-                    continue
-                winner_paths.append(winner_path)
-                winner_path_set.add(winner_path)
+            winner_paths = list(dict.fromkeys(Path(item["path"]) for item in winners))
+            winner_path_set = set(winner_paths)
 
             for item in burst_results:
                 item["burst_size"] = len(burst_results)
