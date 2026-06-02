@@ -24,6 +24,8 @@ from models import CropBox, Detection, SportProfile, BoundingBox
 
 
 DANCE_CULL_SCHEMA_VERSION = "dance_v2"
+SCENE_TYPE_VALUES = {"intro_pose", "finale_pose", "group_static_pose", "action", "unknown"}
+MIN_STATIC_GROUP_BURST_KEEP = 2
 
 
 class DanceCullCache:
@@ -116,6 +118,7 @@ class AICullTool:
 
         self.use_dance_vl_var = tk.BooleanVar(value=True)
         self.use_dance_vl_subject_picker_var = tk.BooleanVar(value=True)
+        self.use_dance_scene_classifier_var = tk.BooleanVar(value=True)
         self.save_vl_debug_images_var = tk.BooleanVar(value=True)
         self.show_dance_debug_preview_var = tk.BooleanVar(value=True)
 
@@ -128,6 +131,7 @@ class AICullTool:
         self.current_vl_debug_image_path: Path | None = None
         self.current_vl_mismatch: bool = False
         self.current_vl_mismatch_context: dict | None = None
+        self.current_scene_classification: dict | None = None
 
         self.auto_running = False
         self.auto_cancel_requested = False
@@ -270,6 +274,15 @@ class AICullTool:
 
         tk.Checkbutton(
             self.dance_frame,
+            text="Classify Intro/Finale/Group Poses",
+            variable=self.use_dance_scene_classifier_var,
+            bg="#2a2a2a",
+            fg="white",
+            selectcolor="#444",
+        ).pack(anchor="w")
+
+        tk.Checkbutton(
+            self.dance_frame,
             text="Save VL Debug Images",
             variable=self.save_vl_debug_images_var,
             bg="#2a2a2a",
@@ -376,6 +389,7 @@ class AICullTool:
             "sport_type": getattr(profile, "sport_type", "generic"),
             "use_dance_vl": bool(self.use_dance_vl_var.get()),
             "use_dance_vl_subject_picker": bool(self.use_dance_vl_subject_picker_var.get()),
+            "use_dance_scene_classifier": bool(self.use_dance_scene_classifier_var.get()),
             "save_vl_debug_images": bool(self.save_vl_debug_images_var.get()),
             "show_dance_debug_preview": bool(self.show_dance_debug_preview_var.get()),
         }
@@ -870,6 +884,73 @@ class AICullTool:
             max_tokens = 700
 
         return base_url, model, timeout, temperature, max_tokens
+
+    def _default_scene_classification(self) -> dict:
+        return {
+            "scene_type": "unknown",
+            "is_group_pose": False,
+            "is_static_pose": False,
+            "should_keep_full_frame": False,
+            "should_avoid_subject_crop": False,
+            "reason": "",
+            "confidence": 0.0,
+        }
+
+    def _normalize_scene_classification(self, value: dict | None) -> dict:
+        merged = self._default_scene_classification()
+        if isinstance(value, dict):
+            merged.update(value)
+
+        scene_type = str(merged.get("scene_type", "unknown")).strip().lower()
+        if scene_type not in SCENE_TYPE_VALUES:
+            scene_type = "unknown"
+
+        try:
+            confidence = float(merged.get("confidence", 0.0))
+        except Exception:
+            confidence = 0.0
+
+        return {
+            "scene_type": scene_type,
+            "is_group_pose": LMStudioClient._to_bool(merged.get("is_group_pose", False)),
+            "is_static_pose": LMStudioClient._to_bool(merged.get("is_static_pose", False)),
+            "should_keep_full_frame": LMStudioClient._to_bool(merged.get("should_keep_full_frame", False)),
+            "should_avoid_subject_crop": LMStudioClient._to_bool(merged.get("should_avoid_subject_crop", False)),
+            "reason": str(merged.get("reason", "")).strip(),
+            "confidence": max(0.0, min(1.0, confidence)),
+        }
+
+    def _scene_requires_composition_preservation(self, scene: dict | None) -> bool:
+        normalized = self._normalize_scene_classification(scene)
+        if normalized["scene_type"] in LMStudioClient.COMPOSITION_PRESERVE_SCENE_TYPES:
+            return True
+        return bool(normalized["should_keep_full_frame"] or normalized["should_avoid_subject_crop"])
+
+    def _scene_is_static_group_pose(self, item: dict) -> bool:
+        scene = item.get("scene_classification")
+        if not isinstance(scene, dict):
+            scene = {
+                "scene_type": item.get("scene_type", "unknown"),
+                "is_group_pose": item.get("is_group_pose", False),
+                "is_static_pose": item.get("is_static_pose", False),
+                "should_keep_full_frame": item.get("should_keep_full_frame", False),
+                "should_avoid_subject_crop": item.get("should_avoid_subject_crop", False),
+            }
+        scene = self._normalize_scene_classification(scene)
+        if self._scene_requires_composition_preservation(scene):
+            return True
+        return bool(scene.get("is_group_pose", False) and scene.get("is_static_pose", False))
+
+    def _classify_scene_with_vl(self, image_path: Path) -> dict:
+        base_url, model, timeout, temperature, max_tokens = self._dance_lmstudio_settings()
+        client = LMStudioClient(base_url=base_url, timeout=timeout)
+        scene = client.classify_scene_type(
+            model=model,
+            image_path=image_path,
+            temperature=min(temperature, 0.2),
+            max_tokens=max(256, min(max_tokens, 450)),
+        )
+        return self._normalize_scene_classification(scene)
 
     def _score_dance_vl_rubric(self, rubric: dict) -> tuple[float, str]:
         score = 0.0
@@ -1503,9 +1584,31 @@ class AICullTool:
 
             img_w = self.app.current_image.width if self.app.current_image else 0
             img_h = self.app.current_image.height if self.app.current_image else 0
-            crop_proposal, crop_center_penalty = self._compute_crop_proposal(
-                chosen, img_w, img_h, profile.main_ratio or "4:5"
-            )
+            scene_classification = self._default_scene_classification()
+            if bool(config.get("use_dance_scene_classifier", False)):
+                try:
+                    scene_classification = self._classify_scene_with_vl(Path(image_path))
+                    self.app.log(
+                        "AI Cull Dance VL scene: "
+                        f"type={scene_classification.get('scene_type', 'unknown')} "
+                        f"full_frame={scene_classification.get('should_keep_full_frame', False)} "
+                        f"avoid_subject_crop={scene_classification.get('should_avoid_subject_crop', False)} "
+                        f"confidence={float(scene_classification.get('confidence', 0.0)):.2f}"
+                    )
+                except Exception as exc:
+                    self.app.log(f"AI Cull Dance VL scene classifier failed: {exc}")
+
+            if self._scene_requires_composition_preservation(scene_classification):
+                crop_proposal = BoundingBox(0, 0, img_w, img_h) if img_w > 0 and img_h > 0 else None
+                crop_center_penalty = 0.0
+                self.app.log(
+                    "AI Cull Dance: preserving full-frame composition for "
+                    f"{scene_classification.get('scene_type', 'unknown')} scene."
+                )
+            else:
+                crop_proposal, crop_center_penalty = self._compute_crop_proposal(
+                    chosen, img_w, img_h, profile.main_ratio or "4:5"
+                )
 
             result = self._evaluate_dance_with_vl(Path(image_path))
             final_score = float(result["score"]) + crop_center_penalty
@@ -1532,6 +1635,14 @@ class AICullTool:
                 "vl_rubric": result.get("rubric", {}),
                 "cull_score": final_score,
                 "cull_decision": final_decision,
+                "scene_classification": scene_classification,
+                "scene_type": scene_classification.get("scene_type", "unknown"),
+                "is_group_pose": bool(scene_classification.get("is_group_pose", False)),
+                "is_static_pose": bool(scene_classification.get("is_static_pose", False)),
+                "should_keep_full_frame": bool(scene_classification.get("should_keep_full_frame", False)),
+                "should_avoid_subject_crop": bool(scene_classification.get("should_avoid_subject_crop", False)),
+                "scene_reason": str(scene_classification.get("reason", "")),
+                "scene_confidence": float(scene_classification.get("confidence", 0.0)),
             }
             self._put_cached_entry(Path(image_path), cache_entry, rules_hash)
 
@@ -1552,6 +1663,14 @@ class AICullTool:
                 "vl_debug_image_path": self.current_vl_debug_image_path,
                 "chosen_id": chosen.id if chosen else None,
                 "chosen_reason": chosen_reason,
+                "scene_classification": scene_classification,
+                "scene_type": scene_classification.get("scene_type", "unknown"),
+                "is_group_pose": bool(scene_classification.get("is_group_pose", False)),
+                "is_static_pose": bool(scene_classification.get("is_static_pose", False)),
+                "should_keep_full_frame": bool(scene_classification.get("should_keep_full_frame", False)),
+                "should_avoid_subject_crop": bool(scene_classification.get("should_avoid_subject_crop", False)),
+                "scene_reason": str(scene_classification.get("reason", "")),
+                "scene_confidence": float(scene_classification.get("confidence", 0.0)),
             }
         finally:
             self.app.state.current_image_path = previous_path
@@ -1877,9 +1996,16 @@ class AICullTool:
         for burst_index, burst_paths in enumerate(bursts, start=1):
             burst_results = [path_to_result[p] for p in burst_paths if p in path_to_result]
             ranked = self._rank_burst_candidates(burst_results)
-            winners, vl_meta = self._select_burst_winners_with_vl(ranked, keep_per_burst, config)
+            has_static_group_pose = any(self._scene_is_static_group_pose(item) for item in burst_results)
+            keep_target = keep_per_burst
+            if has_static_group_pose and len(burst_results) > 1:
+                # Static intro/finale/group tableaux often have multiple usable ensemble variants;
+                # keep at least two to avoid over-suppressing composition-preserving frames.
+                keep_target = min(len(burst_results), max(keep_per_burst, MIN_STATIC_GROUP_BURST_KEEP))
+
+            winners, vl_meta = self._select_burst_winners_with_vl(ranked, keep_target, config)
             if not winners:
-                winners = ranked[:keep_per_burst]
+                winners = ranked[:keep_target]
             winner_paths = {Path(item["path"]) for item in winners}
             winner_path_strings = [str(p) for p in sorted(winner_paths, key=lambda p: p.name.lower())]
             vl_used = bool(vl_meta) and "error" not in vl_meta
@@ -1892,6 +2018,8 @@ class AICullTool:
                 item["burst_rank"] = rank_by_path.get(Path(item["path"]), 0)
                 item["burst_winner_paths"] = winner_path_strings
                 item["burst_vl_selector_used"] = vl_used
+                item["burst_keep_target"] = keep_target
+                item["burst_conservative_scene_mode"] = has_static_group_pose
                 if vl_meta:
                     item["burst_vl_selector"] = vl_meta
                 if Path(item["path"]) not in winner_paths:
@@ -1912,6 +2040,8 @@ class AICullTool:
                 "burst_suppressed": bool(item.get("burst_suppressed", False)),
                 "burst_winner_paths": [str(p) for p in item.get("burst_winner_paths", []) or []],
                 "burst_vl_selector_used": bool(item.get("burst_vl_selector_used", False)),
+                "burst_keep_target": int(item.get("burst_keep_target", 1)),
+                "burst_conservative_scene_mode": bool(item.get("burst_conservative_scene_mode", False)),
             }
             if item.get("burst_vl_selector"):
                 burst_updates["burst_vl_selector"] = dict(item.get("burst_vl_selector", {}))
@@ -1967,6 +2097,7 @@ class AICullTool:
         self.current_vl_debug_image_path = None
         self.current_vl_mismatch = False
         self.current_vl_mismatch_context = None
+        self.current_scene_classification = None
         self.app.clear_debug_views()
 
         self._refresh_dynamic_sections()
@@ -2032,9 +2163,33 @@ class AICullTool:
 
             img_w = self.app.current_image.width if self.app.current_image else 0
             img_h = self.app.current_image.height if self.app.current_image else 0
-            crop_proposal, crop_center_penalty = self._compute_crop_proposal(
-                chosen, img_w, img_h, profile.main_ratio or "4:5"
-            )
+            scene_classification = self._default_scene_classification()
+            if bool(runtime_config.get("use_dance_scene_classifier", False)):
+                try:
+                    scene_classification = self._classify_scene_with_vl(self.app.state.current_image_path)
+                    self.app.log(
+                        "AI Cull Dance VL scene: "
+                        f"type={scene_classification.get('scene_type', 'unknown')} "
+                        f"full_frame={scene_classification.get('should_keep_full_frame', False)} "
+                        f"avoid_subject_crop={scene_classification.get('should_avoid_subject_crop', False)} "
+                        f"confidence={float(scene_classification.get('confidence', 0.0)):.2f}"
+                    )
+                except Exception as exc:
+                    self.app.log(f"AI Cull Dance VL scene classifier failed: {exc}")
+
+            self.current_scene_classification = scene_classification
+
+            if self._scene_requires_composition_preservation(scene_classification):
+                crop_proposal = BoundingBox(0, 0, img_w, img_h) if img_w > 0 and img_h > 0 else None
+                crop_center_penalty = 0.0
+                self.app.log(
+                    "AI Cull Dance: preserving full-frame composition for "
+                    f"{scene_classification.get('scene_type', 'unknown')} scene."
+                )
+            else:
+                crop_proposal, crop_center_penalty = self._compute_crop_proposal(
+                    chosen, img_w, img_h, profile.main_ratio or "4:5"
+                )
             if crop_center_penalty < 0:
                 self.app.log(
                     f"AI Cull Dance: crop centre penalty={crop_center_penalty:.1f} "
@@ -2081,6 +2236,14 @@ class AICullTool:
                     if crop_proposal else None
                 ),
                 "crop_center_penalty": crop_center_penalty,
+                "scene_classification": scene_classification,
+                "scene_type": scene_classification.get("scene_type", "unknown"),
+                "is_group_pose": bool(scene_classification.get("is_group_pose", False)),
+                "is_static_pose": bool(scene_classification.get("is_static_pose", False)),
+                "should_keep_full_frame": bool(scene_classification.get("should_keep_full_frame", False)),
+                "should_avoid_subject_crop": bool(scene_classification.get("should_avoid_subject_crop", False)),
+                "scene_reason": str(scene_classification.get("reason", "")),
+                "scene_confidence": float(scene_classification.get("confidence", 0.0)),
             }
 
             if bool(runtime_config.get("use_dance_vl", False)):

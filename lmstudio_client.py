@@ -10,6 +10,9 @@ from PIL import Image, ImageOps
 
 
 class LMStudioClient:
+    SCENE_TYPES = {"intro_pose", "finale_pose", "group_static_pose", "action", "unknown"}
+    COMPOSITION_PRESERVE_SCENE_TYPES = {"intro_pose", "finale_pose", "group_static_pose"}
+
     def __init__(self, base_url: str, timeout: float = 60.0):
         self.base_url = base_url.strip().rstrip("/")
         self.timeout = float(timeout)
@@ -358,6 +361,81 @@ class LMStudioClient:
             max_tokens=max_tokens,
         )
         return self._extract_json_object(text)
+
+    @staticmethod
+    def _to_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        text = str(value or "").strip().lower()
+        return text in {"1", "true", "yes", "y", "on"}
+
+    def classify_scene_type(
+        self,
+        model: str,
+        image_path: str | Path,
+        temperature: float = 0.1,
+        max_tokens: int = 450,
+    ) -> dict:
+        system_prompt = (
+            "You are a dance recital scene-type classifier.\n\n"
+            "Classify the image into one of these scene_type values:\n"
+            "- intro_pose\n"
+            "- finale_pose\n"
+            "- group_static_pose\n"
+            "- action\n"
+            "- unknown\n\n"
+            "Return ONLY valid JSON (no markdown, no extra text) with exactly these keys:\n"
+            "- scene_type\n"
+            "- is_group_pose\n"
+            "- is_static_pose\n"
+            "- should_keep_full_frame\n"
+            "- should_avoid_subject_crop\n"
+            "- reason\n"
+            "- confidence\n\n"
+            "Rules:\n"
+            "- confidence must be a number between 0 and 1.\n"
+            "- reason must be one short sentence.\n"
+            "- If the whole ensemble/stage composition matters, set should_keep_full_frame=true.\n"
+            "- For intro/finale/group static tableau scenes, avoid tight subject crops.\n"
+            "- If unsure, use scene_type='unknown'."
+        )
+
+        user_prompt = (
+            "Classify whether this dance recital frame is intro pose, finale pose, group static pose, or action.\n"
+            "Return only the required JSON."
+        )
+
+        text = self.vision_chat_text(
+            model=model,
+            image_path=image_path,
+            user_prompt=user_prompt,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        parsed = self._extract_json_object(text)
+
+        scene_type = str(parsed.get("scene_type", "unknown")).strip().lower()
+        if scene_type not in self.SCENE_TYPES:
+            scene_type = "unknown"
+
+        try:
+            confidence = float(parsed.get("confidence", 0.0))
+        except Exception:
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
+
+        return {
+            "scene_type": scene_type,
+            "is_group_pose": self._to_bool(parsed.get("is_group_pose", False)),
+            "is_static_pose": self._to_bool(parsed.get("is_static_pose", False)),
+            "should_keep_full_frame": self._to_bool(parsed.get("should_keep_full_frame", False)),
+            "should_avoid_subject_crop": self._to_bool(parsed.get("should_avoid_subject_crop", False)),
+            "reason": str(parsed.get("reason", "")).strip(),
+            "confidence": confidence,
+        }
 
     def test_connection(self) -> tuple[bool, str]:
         try:
