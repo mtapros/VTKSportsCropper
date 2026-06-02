@@ -395,6 +395,29 @@ class AICropTool:
 
         img_w = self.app.current_image.width
         img_h = self.app.current_image.height
+
+        scene_entry = entry.get("scene_classification", {})
+        if not isinstance(scene_entry, dict):
+            scene_entry = {}
+
+        scene_type = str(scene_entry.get("scene_type", entry.get("scene_type", "unknown"))).strip().lower()
+
+        def _cache_bool(raw_value) -> bool:
+            if isinstance(raw_value, bool):
+                return raw_value
+            if isinstance(raw_value, (int, float)):
+                return raw_value != 0
+            return str(raw_value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+        keep_full_frame = _cache_bool(scene_entry.get("should_keep_full_frame", entry.get("should_keep_full_frame", False)))
+        avoid_subject_crop = _cache_bool(
+            scene_entry.get("should_avoid_subject_crop", entry.get("should_avoid_subject_crop", False))
+        )
+        if scene_type in {"intro_pose", "finale_pose", "group_static_pose"} or keep_full_frame or avoid_subject_crop:
+            crop = BoundingBox(0, 0, img_w, img_h)
+            self.app.log(f"AI Crop cache: {image_path.name} using full-frame composition-preserving mode.")
+            return crop, "cache full-frame"
+
         near_edge = self._is_bbox_near_edge(bbox, img_w, img_h)
 
         if near_edge:
