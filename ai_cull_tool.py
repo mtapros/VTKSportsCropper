@@ -845,6 +845,9 @@ class AICullTool:
         base_url, model, timeout, temperature, max_tokens = self._dance_lmstudio_settings()
         client = LMStudioClient(base_url=base_url, timeout=timeout)
         profile = self.get_profile_data()
+        rubric_name = getattr(profile, "vl_rubric_name", "generic")
+        if str(getattr(profile, "sport_type", "")).strip().lower() == "dance" and str(rubric_name).strip().lower() == "generic":
+            rubric_name = "dance"
         candidates = self._get_vl_burst_candidates(ranked, keep_per_burst)
         frame_map: dict[str, dict] = {}
         frames: list[dict] = []
@@ -868,7 +871,7 @@ class AICullTool:
         selection = client.select_burst_best_frame(
             model=model,
             frames=frames,
-            rubric_name=getattr(profile, "vl_rubric_name", "generic"),
+            rubric_name=rubric_name,
             temperature=temperature,
             max_tokens=max_tokens,
         )
