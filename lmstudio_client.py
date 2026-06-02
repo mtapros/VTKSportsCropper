@@ -267,7 +267,10 @@ class LMStudioClient:
             frame_id = str(frame.get("frame_id", "")).strip()
             if not frame_id:
                 raise ValueError("Each burst frame must include a frame_id.")
-            filename = str(frame.get("filename", "")).strip() or Path(frame["image_path"]).name
+            image_path = frame.get("image_path")
+            if not image_path:
+                raise ValueError(f"Burst frame {frame_id!r} is missing image_path.")
+            filename = str(frame.get("filename", "")).strip() or Path(image_path).name
             decision = str(frame.get("decision", "")).strip() or "Unknown"
             score = float(frame.get("heuristic_score", 0.0))
             focus_score = float(frame.get("focus_score", 0.0))
@@ -284,7 +287,7 @@ class LMStudioClient:
                     ),
                 }
             )
-            content.append(self._image_content_item(frame["image_path"], max_side=768, jpeg_quality=85))
+            content.append(self._image_content_item(image_path, max_side=768, jpeg_quality=85))
 
         data = self.vision_chat(
             model=model,

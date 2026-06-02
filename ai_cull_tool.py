@@ -1741,14 +1741,14 @@ class AICullTool:
                     )
             winners = ranked[:keep_per_burst]
             winner_paths = [Path(item["path"]) for item in winners]
-            winner_path_set = set(winner_paths)
+            winner_path_set = {Path(item["path"]) for item in winners}
 
             for item in burst_results:
                 item["burst_size"] = len(burst_results)
                 item["burst_winner_paths"] = [str(p) for p in winner_paths]
                 item["burst_selection_source"] = burst_selection_source
                 item["burst_vl_reason"] = str((burst_selection or {}).get("reason", "")).strip()
-                item["burst_vl_confidence"] = (burst_selection or {}).get("confidence")
+                item["burst_vl_confidence"] = float((burst_selection or {}).get("confidence", 0.0) or 0.0)
                 if Path(item["path"]) not in winner_path_set:
                     item["decision"] = "Reject"
                     item["burst_suppressed"] = True
