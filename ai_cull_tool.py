@@ -481,7 +481,7 @@ class AICullTool:
             label = path.name
             if is_suppressed:
                 label = f"{path.name} [Burst Suppressed]"
-            elif int(burst_entry.get("burst_size", 1) or 1) > 1:
+            elif int(burst_entry.get("burst_size", 1)) > 1:
                 label = f"{path.name} [Burst Kept]"
 
             if is_suppressed and hide_suppressed:
@@ -505,11 +505,11 @@ class AICullTool:
             return
 
         burst_entry = self._get_burst_cache_entry(Path(image_path))
-        burst_size = int(burst_entry.get("burst_size", 1) or 1)
+        burst_size = int(burst_entry.get("burst_size", 1))
         if burst_size <= 1:
             return
 
-        burst_rank = int(burst_entry.get("burst_rank", 0) or 0)
+        burst_rank = int(burst_entry.get("burst_rank", 0))
         burst_group_id = str(burst_entry.get("burst_group_id", "burst"))
         if bool(burst_entry.get("burst_suppressed", False)):
             winners = [Path(p).name for p in burst_entry.get("burst_winner_paths", []) if p]
@@ -1907,8 +1907,8 @@ class AICullTool:
             image_path = Path(item["path"])
             burst_updates = {
                 "burst_group_id": item.get("burst_group_id"),
-                "burst_rank": int(item.get("burst_rank", 0) or 0),
-                "burst_size": int(item.get("burst_size", 1) or 1),
+                "burst_rank": int(item.get("burst_rank", 0)),
+                "burst_size": int(item.get("burst_size", 1)),
                 "burst_suppressed": bool(item.get("burst_suppressed", False)),
                 "burst_winner_paths": [str(p) for p in item.get("burst_winner_paths", []) or []],
                 "burst_vl_selector_used": bool(item.get("burst_vl_selector_used", False)),
@@ -2303,7 +2303,7 @@ class AICullTool:
                 burst_group_ids = {
                     str(item.get("burst_group_id", ""))
                     for item in suppressed_results
-                    if int(item.get("burst_size", 1) or 1) > 1
+                    if int(item.get("burst_size", 1)) > 1
                 }
                 kept_count = sum(1 for r in suppressed_results if not r.get("burst_suppressed", False))
                 suppressed_count = sum(1 for r in suppressed_results if r.get("burst_suppressed", False))

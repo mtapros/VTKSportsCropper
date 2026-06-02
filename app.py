@@ -135,8 +135,8 @@ class SportsToolkitApp:
             self.ui.clear_debug_views()
             self._refresh_header_info()
             return
-        paths = self.image_repo.list_images(self.state.input_folder)
-        self.state.all_image_paths = list(paths)
+        paths = list(self.image_repo.list_images(self.state.input_folder))
+        self.state.all_image_paths = paths
 
         if not paths:
             self.current_image = None
@@ -156,7 +156,7 @@ class SportsToolkitApp:
         self.log(f"Loaded {len(paths)} image(s) from input folder.")
 
     def refresh_image_browser(self):
-        full_paths = list(self.state.all_image_paths)
+        full_paths = self.state.all_image_paths
         if not full_paths:
             self.state.image_paths = []
             self.state.current_index = 0
@@ -172,7 +172,7 @@ class SportsToolkitApp:
             self._refresh_header_info()
             return
 
-        visible_paths = list(full_paths)
+        visible_paths = full_paths
         labels = None
         ai_cull_tool = self.tools.get("ai_cull")
         if ai_cull_tool and hasattr(ai_cull_tool, "get_folder_browser_state"):
