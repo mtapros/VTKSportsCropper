@@ -300,14 +300,14 @@ class LMStudioClient:
         if not choices:
             raise ValueError("Empty burst selection response")
         message = choices[0].get("message", {})
-        content = message.get("content", "")
-        if isinstance(content, list):
+        content_text = message.get("content", "")
+        if isinstance(content_text, list):
             text_parts = []
-            for item in content:
+            for item in content_text:
                 if isinstance(item, dict) and item.get("type") == "text":
                     text_parts.append(item.get("text", ""))
-            content = "\n".join(part for part in text_parts if part)
-        return self._extract_json_object(str(content))
+            content_text = "\n".join(part for part in text_parts if part)
+        return self._extract_json_object(str(content_text))
 
     def dance_cull_rubric(
         self,

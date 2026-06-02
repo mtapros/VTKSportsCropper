@@ -1740,8 +1740,12 @@ class AICullTool:
                         f"AI Cull burst VL selector failed for {Path(burst_results[0]['path']).name}: {exc}"
                     )
             winners = ranked[:keep_per_burst]
-            winner_paths = [Path(item["path"]) for item in winners]
-            winner_path_set = {Path(item["path"]) for item in winners}
+            winner_paths: list[Path] = []
+            winner_path_set: set[Path] = set()
+            for item in winners:
+                winner_path = Path(item["path"])
+                winner_paths.append(winner_path)
+                winner_path_set.add(winner_path)
 
             for item in burst_results:
                 item["burst_size"] = len(burst_results)
