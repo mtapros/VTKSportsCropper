@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import math
 import shutil
@@ -218,7 +219,7 @@ class AICullTool:
 
         tk.Label(
             self.dance_frame,
-            text="Dance VL Culling",
+            text="Vision Model Culling",
             bg="#2a2a2a",
             fg="#ffd27f",
             font=("Arial", 10, "bold"),
@@ -226,7 +227,7 @@ class AICullTool:
 
         tk.Checkbutton(
             self.dance_frame,
-            text="Use LM Studio VL Dance Rubric",
+            text="Use LM Studio VL Rubric",
             variable=self.use_dance_vl_var,
             bg="#2a2a2a",
             fg="white",
@@ -289,10 +290,8 @@ class AICullTool:
     def _refresh_dynamic_sections(self):
         if self.dance_frame is None:
             return
-        if self._current_profile_is_dance():
+        if not self.dance_frame.winfo_ismapped():
             self.dance_frame.pack(fill="x", padx=10, pady=(12, 4))
-        else:
-            self.dance_frame.pack_forget()
 
     def apply_profile(self, profile: SportProfile):
         prompts = list(profile.prompts[:4])
@@ -317,12 +316,13 @@ class AICullTool:
             join_descriptors=False,
             safe_ratios={},
             sport_type=getattr(base_profile, "sport_type", "generic"),
-            dance_prefer_full_body=getattr(base_profile, "dance_prefer_full_body", True),
-            dance_penalize_cropped_feet=getattr(base_profile, "dance_penalize_cropped_feet", True),
-            dance_favor_symmetry=getattr(base_profile, "dance_favor_symmetry", False),
-            dance_favor_peak_action=getattr(base_profile, "dance_favor_peak_action", True),
-            dance_prefer_clean_pose=getattr(base_profile, "dance_prefer_clean_pose", True),
-            dance_prefer_single_subject=getattr(base_profile, "dance_prefer_single_subject", False),
+            vl_rubric_name=getattr(base_profile, "vl_rubric_name", "generic"),
+            prefer_full_body=getattr(base_profile, "prefer_full_body", True),
+            penalize_cropped_feet=getattr(base_profile, "penalize_cropped_feet", True),
+            favor_symmetry=getattr(base_profile, "favor_symmetry", False),
+            favor_peak_action=getattr(base_profile, "favor_peak_action", True),
+            prefer_clean_pose=getattr(base_profile, "prefer_clean_pose", True),
+            prefer_single_subject=getattr(base_profile, "prefer_single_subject", False),
         )
 
     def get_runtime_config(self) -> dict:
@@ -785,6 +785,9 @@ class AICullTool:
         full_body_visibility = str(rubric.get("full_body_visibility", "")).strip().lower()
         feet_visibility = str(rubric.get("feet_visibility", "")).strip().lower()
         face_facing_camera = str(rubric.get("face_facing_camera", "")).strip().lower()
+        overall_keeper = str(
+            rubric.get("overall_keeper", rubric.get("overall_dance_keeper", ""))
+        ).strip().lower()
 
         if sharpness == "blurry" or subject_visibility == "weak":
             return score, "Reject"
@@ -795,6 +798,8 @@ class AICullTool:
         if feet_visibility == "cropped_out" or full_body_visibility == "partial":
             if score >= 55:
                 return score, "Maybe"
+        if overall_keeper in {"keep", "maybe", "reject"}:
+            return score, overall_keeper.capitalize()
 
         if score >= 55:
             return score, "Keep"
@@ -1313,12 +1318,30 @@ class AICullTool:
     def _evaluate_dance_with_vl(self, image_path: Path) -> dict:
         base_url, model, timeout, temperature, max_tokens = self._dance_lmstudio_settings()
         client = LMStudioClient(base_url=base_url, timeout=timeout)
-        rubric = client.dance_cull_rubric(
-            model=model,
-            image_path=image_path,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        profile = self.get_profile_data()
+        rubric_name = getattr(profile, "vl_rubric_name", "generic")
+        if hasattr(client, "generic_cull_rubric"):
+            generic_cull = client.generic_cull_rubric
+            generic_kwargs = {
+                "model": model,
+                "image_path": image_path,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+            try:
+                params = inspect.signature(generic_cull).parameters
+                if "rubric_name" in params:
+                    generic_kwargs["rubric_name"] = rubric_name
+            except (TypeError, ValueError):
+                pass
+            rubric = generic_cull(**generic_kwargs)
+        else:
+            rubric = client.dance_cull_rubric(
+                model=model,
+                image_path=image_path,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
         score, decision = self._score_dance_vl_rubric(rubric)
         return {
             "path": Path(image_path),
@@ -1428,7 +1451,7 @@ class AICullTool:
             self.app.current_af_boxes = previous_af
 
     def evaluate_image_for_pipeline(self, image_path, config: dict) -> dict:
-        if str(config.get("sport_type", "")).lower() == "dance" and bool(config.get("use_dance_vl", False)):
+        if bool(config.get("use_dance_vl", False)):
             return self._evaluate_dance_full_pipeline(Path(image_path), config)
 
         previous_path = self.app.state.current_image_path
@@ -1565,7 +1588,7 @@ class AICullTool:
 
         runtime_config = self.get_runtime_config()
 
-        if str(runtime_config.get("sport_type", "")).lower() == "dance":
+        if str(runtime_config.get("sport_type", "")).lower() == "dance" or bool(runtime_config.get("use_dance_vl", False)):
             profile = self.get_profile_data()
             prompts = [p.strip() for p in profile.prompts if p.strip()]
             detection_mode = self.detection_mode_var.get().strip() or "Phrase Only"
