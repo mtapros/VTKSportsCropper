@@ -1926,7 +1926,7 @@ class AICullTool:
             self.app.log("AI Cull: please select an input folder first.")
             return
 
-        if not self.app.state.all_image_paths:
+        if not (self.app.state.all_image_paths or self.app.state.image_paths):
             self.app.log("AI Cull: loading images from input folder...")
             self.app.start_batch()
 
@@ -2327,20 +2327,17 @@ class AICullTool:
         image_path = self.auto_images[self.auto_index]
         try:
             config = self.get_runtime_config()
+            if self.auto_mode != "burst_suppression":
+                self.app.state.current_index = self.auto_index
+                self.app.load_current_image()
+            result = self.evaluate_image_for_pipeline(image_path, config)
+            self.auto_results.append(result)
             if self.auto_mode == "burst_suppression":
-                result = self.evaluate_image_for_pipeline(image_path, config)
-                self.auto_results.append(result)
                 self.app.log(
                     f"AI Cull Burst {self.auto_index + 1}/{len(self.auto_images)}: "
                     f"{image_path.name} analyzed score={float(result.get('score', 0.0)):.1f}"
                 )
             else:
-                self.app.state.current_index = self.auto_index
-                self.app.load_current_image()
-
-                result = self.evaluate_image_for_pipeline(image_path, config)
-                self.auto_results.append(result)
-
                 decision = result.get("decision", "Reject")
                 if decision not in ("Keep", "Maybe", "Reject"):
                     decision = "Reject"
