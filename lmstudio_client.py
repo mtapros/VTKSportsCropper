@@ -157,6 +157,62 @@ class LMStudioClient:
             return "\n".join(p for p in parts if p)
         return json.dumps(content, indent=2)
 
+    def vision_chat_text_multi(
+        self,
+        model: str,
+        image_paths: list[str | Path],
+        user_prompt: str,
+        system_prompt: str = "You are a concise sports photography vision assistant.",
+        temperature: float = 0.2,
+        max_tokens: int = 512,
+    ) -> str:
+        if not image_paths:
+            return ""
+
+        content: list[dict] = [{"type": "text", "text": user_prompt}]
+        for idx, image_path in enumerate(image_paths, start=1):
+            content.append({"type": "text", "text": f"Frame {idx}: {Path(image_path).name}"})
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": self._image_file_to_data_url(image_path)},
+                }
+            )
+
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": content,
+                },
+            ],
+            "temperature": float(temperature),
+            "max_tokens": int(max_tokens),
+            "stream": False,
+        }
+
+        data = self._http_post_json("/chat/completions", payload)
+        choices = data.get("choices", [])
+        if not choices:
+            return ""
+
+        message = choices[0].get("message", {})
+        response_content = message.get("content", "")
+        if isinstance(response_content, str):
+            return response_content
+        if isinstance(response_content, list):
+            parts = []
+            for item in response_content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+            return "\n".join(p for p in parts if p)
+        return json.dumps(response_content, indent=2)
+
     def _extract_json_object(self, text: str) -> dict:
         text = (text or "").strip()
         if not text:
@@ -247,6 +303,55 @@ class LMStudioClient:
         text = self.vision_chat_text(
             model=model,
             image_path=image_path,
+            user_prompt=user_prompt,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return self._extract_json_object(text)
+
+    def burst_select_frames(
+        self,
+        model: str,
+        image_paths: list[str | Path],
+        temperature: float = 0.1,
+        max_tokens: int = 500,
+    ) -> dict:
+        if not image_paths:
+            raise ValueError("No burst frames provided")
+
+        frame_names = [Path(p).name for p in image_paths]
+        frame_list_text = "\n".join(f"- {name}" for name in frame_names)
+
+        system_prompt = (
+            "You are a sports burst-frame selector.\n"
+            "You are given multiple near-duplicate frames from one burst.\n"
+            "Choose the best deliverable frame and optional alternates.\n\n"
+            "Return only valid JSON (no markdown, no prose outside JSON) with exactly these keys:\n"
+            "- best_frame\n"
+            "- alternates\n"
+            "- rejects\n"
+            "- confidence\n"
+            "- reason\n\n"
+            "Rules:\n"
+            "- best_frame must be one of the provided filenames.\n"
+            "- alternates and rejects must be arrays of provided filenames (can be empty).\n"
+            "- confidence must be a number between 0 and 1.\n"
+            "- reason must be one short sentence.\n"
+            "- Prefer the sharpest, cleanest, strongest-timing frame.\n"
+            "- Prefer clear subject visibility and minimal motion blur.\n"
+            "- If unsure, choose the frame that is most reliably usable."
+        )
+
+        user_prompt = (
+            "Select the best frame from this burst and optional alternates.\n"
+            "Only use filenames from this list:\n"
+            f"{frame_list_text}"
+        )
+
+        text = self.vision_chat_text_multi(
+            model=model,
+            image_paths=image_paths,
             user_prompt=user_prompt,
             system_prompt=system_prompt,
             temperature=temperature,
