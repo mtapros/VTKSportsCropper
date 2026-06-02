@@ -25,7 +25,7 @@ from models import CropBox, Detection, SportProfile, BoundingBox
 
 DANCE_CULL_SCHEMA_VERSION = "dance_v2"
 SCENE_TYPE_VALUES = {"intro_pose", "finale_pose", "group_static_pose", "action", "unknown"}
-COMPOSITION_PRESERVE_SCENE_TYPES = {"intro_pose", "finale_pose", "group_static_pose"}
+MIN_STATIC_GROUP_BURST_KEEP = 2
 
 
 class DanceCullCache:
@@ -885,15 +885,6 @@ class AICullTool:
 
         return base_url, model, timeout, temperature, max_tokens
 
-    @staticmethod
-    def _to_bool(value) -> bool:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return value != 0
-        text = str(value or "").strip().lower()
-        return text in {"1", "true", "yes", "y", "on"}
-
     def _default_scene_classification(self) -> dict:
         return {
             "scene_type": "unknown",
@@ -921,17 +912,17 @@ class AICullTool:
 
         return {
             "scene_type": scene_type,
-            "is_group_pose": self._to_bool(merged.get("is_group_pose", False)),
-            "is_static_pose": self._to_bool(merged.get("is_static_pose", False)),
-            "should_keep_full_frame": self._to_bool(merged.get("should_keep_full_frame", False)),
-            "should_avoid_subject_crop": self._to_bool(merged.get("should_avoid_subject_crop", False)),
+            "is_group_pose": LMStudioClient._to_bool(merged.get("is_group_pose", False)),
+            "is_static_pose": LMStudioClient._to_bool(merged.get("is_static_pose", False)),
+            "should_keep_full_frame": LMStudioClient._to_bool(merged.get("should_keep_full_frame", False)),
+            "should_avoid_subject_crop": LMStudioClient._to_bool(merged.get("should_avoid_subject_crop", False)),
             "reason": str(merged.get("reason", "")).strip(),
             "confidence": max(0.0, min(1.0, confidence)),
         }
 
     def _scene_requires_composition_preservation(self, scene: dict | None) -> bool:
         normalized = self._normalize_scene_classification(scene)
-        if normalized["scene_type"] in COMPOSITION_PRESERVE_SCENE_TYPES:
+        if normalized["scene_type"] in LMStudioClient.COMPOSITION_PRESERVE_SCENE_TYPES:
             return True
         return bool(normalized["should_keep_full_frame"] or normalized["should_avoid_subject_crop"])
 
@@ -2008,7 +1999,9 @@ class AICullTool:
             has_static_group_pose = any(self._scene_is_static_group_pose(item) for item in burst_results)
             keep_target = keep_per_burst
             if has_static_group_pose and len(burst_results) > 1:
-                keep_target = min(len(burst_results), max(keep_per_burst, 2))
+                # Static intro/finale/group tableaux often have multiple usable ensemble variants;
+                # keep at least two to avoid over-suppressing composition-preserving frames.
+                keep_target = min(len(burst_results), max(keep_per_burst, MIN_STATIC_GROUP_BURST_KEEP))
 
             winners, vl_meta = self._select_burst_winners_with_vl(ranked, keep_target, config)
             if not winners:

@@ -11,6 +11,7 @@ from PIL import Image, ImageOps
 
 class LMStudioClient:
     SCENE_TYPES = {"intro_pose", "finale_pose", "group_static_pose", "action", "unknown"}
+    COMPOSITION_PRESERVE_SCENE_TYPES = {"intro_pose", "finale_pose", "group_static_pose"}
 
     def __init__(self, base_url: str, timeout: float = 60.0):
         self.base_url = base_url.strip().rstrip("/")
