@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import tkinter as tk
+from tkinter import simpledialog
 from tkinter import ttk
 
 from lmstudio_client import LMStudioClient
@@ -10,6 +12,7 @@ from lmstudio_client import LMStudioClient
 class LMStudioTool:
     tool_id = "lmstudio"
     display_name = "LM Studio Test"
+    SETTINGS_WINDOW_GEOMETRY = "560x520"
 
     def __init__(self, app):
         self.app = app
@@ -41,6 +44,205 @@ class LMStudioTool:
         self.good_criteria_box = None
         self.reject_criteria_box = None
         self.vision_schema_box = None
+        self.preset_combo = None
+        self.settings_window = None
+
+        self.active_preset_var = tk.StringVar(value="default")
+        self.presets: dict[str, dict] = {}
+        self._load_presets_file()
+
+    def _preset_file(self) -> Path:
+        return Path(self.app.base_dir) / "lmstudio_presets.json"
+
+    def _default_settings(self) -> dict:
+        return {
+            "base_url": "http://127.0.0.1:1234/v1",
+            "model": "",
+            "timeout": "60",
+            "temperature": "0.2",
+            "max_tokens": "512",
+        }
+
+    def _collect_settings(self) -> dict:
+        return {
+            "base_url": self.base_url_var.get().strip(),
+            "model": self.model_var.get().strip(),
+            "timeout": self.timeout_var.get().strip() or "60",
+            "temperature": self.temperature_var.get().strip() or "0.2",
+            "max_tokens": self.max_tokens_var.get().strip() or "512",
+        }
+
+    def _apply_settings(self, settings: dict):
+        defaults = self._default_settings()
+        merged = dict(defaults)
+        if isinstance(settings, dict):
+            for key in defaults:
+                value = settings.get(key, defaults[key])
+                merged[key] = str(value) if value is not None else defaults[key]
+        self.base_url_var.set(merged["base_url"])
+        self.model_var.set(merged["model"])
+        self.timeout_var.set(merged["timeout"])
+        self.temperature_var.set(merged["temperature"])
+        self.max_tokens_var.set(merged["max_tokens"])
+
+    def _load_presets_file(self):
+        defaults = self._default_settings()
+        active = "default"
+        loaded_presets: dict[str, dict] = {"default": dict(defaults)}
+        path = self._preset_file()
+        try:
+            if path.exists():
+                with path.open("r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, dict):
+                    maybe_presets = raw.get("presets", {})
+                    if isinstance(maybe_presets, dict):
+                        parsed: dict[str, dict] = {}
+                        for name, entry in maybe_presets.items():
+                            if not isinstance(entry, dict):
+                                continue
+                            parsed[str(name)] = {
+                                "base_url": str(entry.get("base_url", defaults["base_url"])),
+                                "model": str(entry.get("model", defaults["model"])),
+                                "timeout": str(entry.get("timeout", defaults["timeout"])),
+                                "temperature": str(entry.get("temperature", defaults["temperature"])),
+                                "max_tokens": str(entry.get("max_tokens", defaults["max_tokens"])),
+                            }
+                        if parsed:
+                            loaded_presets = parsed
+                    active_value = str(raw.get("active_preset", "default")).strip()
+                    if active_value:
+                        active = active_value
+        except Exception as exc:
+            self.app.log(f"LM Studio: failed loading presets ({exc}); using defaults.")
+
+        if "default" not in loaded_presets:
+            loaded_presets["default"] = dict(defaults)
+
+        if active not in loaded_presets:
+            active = "default"
+
+        self.presets = loaded_presets
+        self.active_preset_var.set(active)
+        self._apply_settings(self.presets.get(active, defaults))
+
+    def _save_presets_file(self):
+        path = self._preset_file()
+        try:
+            with path.open("w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "active_preset": self.active_preset_var.get().strip() or "default",
+                        "presets": self.presets,
+                    },
+                    f,
+                    indent=2,
+                )
+        except Exception as exc:
+            self.app.log(f"LM Studio: failed saving presets ({exc}).")
+
+    def _refresh_preset_controls(self):
+        names = sorted(self.presets.keys(), key=lambda n: (n != "default", n.lower()))
+        if not names:
+            names = ["default"]
+            self.presets["default"] = self._default_settings()
+        if self.preset_combo is not None:
+            self.preset_combo["values"] = names
+        active = self.active_preset_var.get().strip() or "default"
+        if active not in self.presets:
+            active = names[0]
+            self.active_preset_var.set(active)
+
+    def _save_active_preset(self):
+        name = self.active_preset_var.get().strip() or "default"
+        self.presets[name] = self._collect_settings()
+        self.active_preset_var.set(name)
+        self._refresh_preset_controls()
+        self._save_presets_file()
+        self.app.log(f'LM Studio: saved preset "{name}".')
+
+    def _save_preset_as(self):
+        name = simpledialog.askstring("Save LM Studio Preset", "Preset name:", parent=self.app.root)
+        if not name:
+            return
+        clean = name.strip()
+        if not clean:
+            return
+        self.active_preset_var.set(clean)
+        self._save_active_preset()
+
+    def _load_active_preset(self):
+        name = self.active_preset_var.get().strip() or "default"
+        preset = self.presets.get(name)
+        if not isinstance(preset, dict):
+            self.app.log(f'LM Studio: preset "{name}" not found.')
+            return
+        self._apply_settings(preset)
+        self.active_preset_var.set(name)
+        self._save_presets_file()
+        self.app.log(f'LM Studio: loaded preset "{name}".')
+
+    def _build_settings_controls(self, parent):
+        pad = {"padx": 10, "pady": 4}
+
+        preset_row = tk.Frame(parent, bg="#2a2a2a")
+        preset_row.pack(fill="x", padx=10, pady=(4, 4))
+        tk.Label(preset_row, text="Preset", bg="#2a2a2a", fg="white").pack(side=tk.LEFT)
+        self.preset_combo = ttk.Combobox(
+            preset_row,
+            textvariable=self.active_preset_var,
+            values=[],
+            state="normal",
+            width=24,
+        )
+        self.preset_combo.pack(side=tk.LEFT, fill="x", expand=True, padx=(8, 6))
+        tk.Button(preset_row, text="Load", command=self._load_active_preset).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(preset_row, text="Save", command=self._save_active_preset).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(preset_row, text="Save As", command=self._save_preset_as).pack(side=tk.LEFT)
+        self._refresh_preset_controls()
+
+        tk.Label(parent, text="Server URL", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+        tk.Entry(parent, textvariable=self.base_url_var).pack(fill="x", **pad)
+
+        tk.Label(parent, text="Model", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+        self.model_combo = ttk.Combobox(parent, textvariable=self.model_var, values=[], state="normal")
+        self.model_combo.pack(fill="x", **pad)
+
+        tk.Label(parent, text="Timeout (seconds)", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+        tk.Entry(parent, textvariable=self.timeout_var).pack(fill="x", **pad)
+
+        tk.Label(parent, text="Temperature", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+        tk.Entry(parent, textvariable=self.temperature_var).pack(fill="x", **pad)
+
+        tk.Label(parent, text="Max Tokens", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+        tk.Entry(parent, textvariable=self.max_tokens_var).pack(fill="x", **pad)
+
+        tk.Button(parent, text="Test Connection", command=self.test_connection).pack(fill="x", padx=10, pady=(10, 4))
+        tk.Button(parent, text="Refresh Models", command=self.refresh_models).pack(fill="x", padx=10, pady=4)
+
+    def open_settings_window(self):
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            self.settings_window.deiconify()
+            self.settings_window.lift()
+            self.settings_window.focus_force()
+            return
+
+        self.settings_window = tk.Toplevel(self.app.root)
+        self.settings_window.title("LM Studio Settings")
+        self.settings_window.geometry(self.SETTINGS_WINDOW_GEOMETRY)
+        self.settings_window.configure(bg="#2a2a2a")
+
+        holder = tk.Frame(self.settings_window, bg="#2a2a2a")
+        holder.pack(fill="both", expand=True, padx=10, pady=10)
+        self._build_settings_controls(holder)
+
+        tk.Button(
+            holder,
+            text="Close",
+            command=self.settings_window.destroy,
+            bg="#555555",
+            fg="white",
+        ).pack(fill="x", padx=10, pady=(12, 6))
 
     def build_panel(self, parent):
         self.panel = tk.Frame(parent, bg="#2a2a2a")
@@ -54,21 +256,7 @@ class LMStudioTool:
             font=("Arial", 11, "bold"),
         ).pack(anchor="w", **pad)
 
-        tk.Label(self.panel, text="Server URL", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
-        tk.Entry(self.panel, textvariable=self.base_url_var).pack(fill="x", **pad)
-
-        tk.Label(self.panel, text="Model", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
-        self.model_combo = ttk.Combobox(self.panel, textvariable=self.model_var, values=[], state="normal")
-        self.model_combo.pack(fill="x", **pad)
-
-        tk.Label(self.panel, text="Timeout (seconds)", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
-        tk.Entry(self.panel, textvariable=self.timeout_var).pack(fill="x", **pad)
-
-        tk.Label(self.panel, text="Temperature", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
-        tk.Entry(self.panel, textvariable=self.temperature_var).pack(fill="x", **pad)
-
-        tk.Label(self.panel, text="Max Tokens", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
-        tk.Entry(self.panel, textvariable=self.max_tokens_var).pack(fill="x", **pad)
+        self._build_settings_controls(self.panel)
 
         tk.Label(self.panel, text="System Prompt", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
         tk.Entry(self.panel, textvariable=self.system_prompt_var).pack(fill="x", **pad)
@@ -76,8 +264,6 @@ class LMStudioTool:
         tk.Label(self.panel, text="User Prompt", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
         tk.Entry(self.panel, textvariable=self.user_prompt_var).pack(fill="x", **pad)
 
-        tk.Button(self.panel, text="Test Connection", command=self.test_connection).pack(fill="x", padx=10, pady=(10, 4))
-        tk.Button(self.panel, text="Refresh Models", command=self.refresh_models).pack(fill="x", padx=10, pady=4)
         tk.Button(self.panel, text="Send Plain Prompt", command=self.send_plain_prompt).pack(fill="x", padx=10, pady=4)
 
         tk.Label(

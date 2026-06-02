@@ -19,7 +19,6 @@ class PipelineTool:
         self.panel = None
 
         self.source_folder_var = tk.StringVar()
-        self.copy_keepers_var = tk.BooleanVar(value=True)
         self.run_crop_var = tk.BooleanVar(value=True)
         self.overwrite_var = tk.BooleanVar(value=False)
 
@@ -30,6 +29,8 @@ class PipelineTool:
         self.images: list[Path] = []
         self.results: list[dict] = []
         self.keeper_paths: list[Path] = []
+        self.routed_count = 0
+        self.bucket_counts = {"Keep": 0, "Maybe": 0, "Reject": 0, "Reject-Bursts": 0}
         self.crop_rows: list[list[str]] = []
 
         self.cull_config: dict = {}
@@ -37,7 +38,10 @@ class PipelineTool:
         self.cached_cull_entries: dict[str, dict] = {}
 
         self.output_root: Path | None = None
-        self.keepers_dir: Path | None = None
+        self.keep_dir: Path | None = None
+        self.maybe_dir: Path | None = None
+        self.reject_dir: Path | None = None
+        self.reject_bursts_dir: Path | None = None
         self.crops_dir: Path | None = None
         self.reports_dir: Path | None = None
 
@@ -70,16 +74,7 @@ class PipelineTool:
 
         tk.Checkbutton(
             self.panel,
-            text="Copy Keepers to Output/Keepers",
-            variable=self.copy_keepers_var,
-            bg="#2a2a2a",
-            fg="white",
-            selectcolor="#444",
-        ).pack(anchor="w", **pad)
-
-        tk.Checkbutton(
-            self.panel,
-            text="Run AI Crop on Keepers",
+            text="Run AI Crop on Output/Keep",
             variable=self.run_crop_var,
             bg="#2a2a2a",
             fg="white",
@@ -125,13 +120,23 @@ class PipelineTool:
         exts = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
         return sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in exts])
 
-    def _copy_keeper(self, src: Path, keepers_dir: Path, overwrite: bool) -> Path:
-        keepers_dir.mkdir(parents=True, exist_ok=True)
-        dst = keepers_dir / src.name
+    def _copy_to_bucket(self, src: Path, bucket_dir: Path, overwrite: bool) -> Path:
+        bucket_dir.mkdir(parents=True, exist_ok=True)
+        dst = bucket_dir / src.name
         if dst.exists() and not overwrite:
             return dst
         shutil.copy2(src, dst)
         return dst
+
+    def _bucket_for_result(self, result: dict) -> tuple[str, Path]:
+        if result.get("burst_suppressed", False):
+            return "Reject-Bursts", self.reject_bursts_dir
+        decision = str(result.get("decision", "Reject"))
+        if decision == "Keep":
+            return "Keep", self.keep_dir
+        if decision == "Maybe":
+            return "Maybe", self.maybe_dir
+        return "Reject", self.reject_dir
 
     def _save_crop_image(self, src_path: Path, crop_box, crops_dir: Path, overwrite: bool):
         crops_dir.mkdir(parents=True, exist_ok=True)
@@ -181,6 +186,7 @@ class PipelineTool:
                     "face_focus",
                     "burst_suppressed",
                     "burst_winner_paths",
+                    "final_bucket",
                 ]
             )
             for r in self.results:
@@ -194,6 +200,7 @@ class PipelineTool:
                         f'{r["face_focus"]:.2f}',
                         bool(r.get("burst_suppressed", False)),
                         "; ".join(r.get("burst_winner_paths", [])),
+                        str(r.get("final_bucket", "")),
                     ]
                 )
 
@@ -261,19 +268,32 @@ class PipelineTool:
             messagebox.showinfo("No images", "No supported images found in the selected folder.")
             return
 
+        self.app.state.input_folder = source_folder
+
         self.cull_config = ai_cull.get_runtime_config()
+        burst_summary = ai_cull.prepare_burst_groups_for_paths(
+            self.images,
+            self.cull_config,
+            source_folder=source_folder,
+        )
         self.crop_config = ai_crop.get_runtime_config()
         self.cached_cull_entries = self._load_cached_cull_entries_by_filename(source_folder)
         self.crop_config["cached_cull_entries"] = self.cached_cull_entries
 
         self.output_root = source_folder / "Output"
-        self.keepers_dir = self.output_root / "Keepers"
-        self.crops_dir = self.output_root / "Crops"
-        self.reports_dir = self.output_root / "Reports"
-        self.reports_dir.mkdir(parents=True, exist_ok=True)
+        self.keep_dir = self.output_root / "Keep"
+        self.maybe_dir = self.output_root / "Maybe"
+        self.reject_dir = self.output_root / "Reject"
+        self.reject_bursts_dir = self.output_root / "Reject-Bursts"
+        self.crops_dir = self.keep_dir / "Crops"
+        self.reports_dir = self.output_root
+        for folder in [self.keep_dir, self.maybe_dir, self.reject_dir, self.reject_bursts_dir]:
+            folder.mkdir(parents=True, exist_ok=True)
 
         self.results = []
         self.keeper_paths = []
+        self.routed_count = 0
+        self.bucket_counts = {"Keep": 0, "Maybe": 0, "Reject": 0, "Reject-Bursts": 0}
         self.crop_rows = []
 
         self.phase = "cull"
@@ -290,7 +310,6 @@ class PipelineTool:
         if self.stop_button is not None:
             self.stop_button.config(state="normal")
 
-        self.app.state.input_folder = source_folder
         self.app.state.output_folder = self.output_root
         self.app.state.image_paths = self.images
         self.app.state.current_index = 0
@@ -298,6 +317,10 @@ class PipelineTool:
         self.app._refresh_header_info()
 
         self.app.log(f"Pipeline: starting full trial on {len(self.images)} images")
+        self.app.log(
+            f"Pipeline Burst Preflight: groups={burst_summary['group_count']} "
+            f"burst-images={burst_summary['burst_images']} fps={burst_summary['fps']:.2f}"
+        )
         self.app.log(f"Pipeline: cull config={self.cull_config}")
         self.app.log(f"Pipeline: crop config={self.crop_config}")
 
@@ -325,6 +348,8 @@ class PipelineTool:
 
         if self.cull_index >= len(self.images):
             self.results = ai_cull.apply_burst_suppression_for_pipeline(self.results, self.cull_config)
+            if hasattr(ai_cull, "persist_burst_suppression_results"):
+                ai_cull.persist_burst_suppression_results(self.results)
             self._write_cull_report()
             self.app.log("Pipeline: cull pass complete")
             self.phase = "review"
@@ -348,10 +373,14 @@ class PipelineTool:
 
     def _step_review(self):
         if self.review_index >= len(self.results):
+            if self.routed_count != len(self.images):
+                raise RuntimeError(
+                    f"Pipeline routing mismatch: routed={self.routed_count} expected={len(self.images)}"
+                )
             if self.run_crop_var.get() and self.keeper_paths:
                 self.phase = "crop"
                 self.crop_index = 0
-                self.app.log(f"Pipeline: starting crop pass on {len(self.keeper_paths)} keepers")
+                self.app.log(f"Pipeline: starting crop pass on {len(self.keeper_paths)} keep image(s)")
             else:
                 self.phase = "done"
             self.app.root.after(10, self._step)
@@ -362,19 +391,19 @@ class PipelineTool:
         display_index = self.review_index if self.review_index < len(self.images) else 0
         self._show_image_in_tool("ai_cull", image_path, display_index)
 
-        if r.get("burst_suppressed", False):
-            winners = ", ".join(Path(p).name for p in r.get("burst_winner_paths", []))
-            self.app.log(f"Pipeline Burst {self.review_index + 1}/{len(self.results)}: {image_path.name} suppressed by {winners}")
-        elif r["decision"] in {"Keep", "Maybe"}:
-            if self.copy_keepers_var.get():
-                copied = self._copy_keeper(image_path, self.keepers_dir, self.overwrite_var.get())
-                self.keeper_paths.append(copied)
-                self.app.log(f"Pipeline Keepers {self.review_index + 1}/{len(self.results)}: copied {image_path.name}")
-            else:
-                self.keeper_paths.append(image_path)
-                self.app.log(f"Pipeline Keepers {self.review_index + 1}/{len(self.results)}: kept {image_path.name}")
-        else:
-            self.app.log(f"Pipeline Review {self.review_index + 1}/{len(self.results)}: rejected {image_path.name}")
+        bucket_name, bucket_dir = self._bucket_for_result(r)
+        copied = self._copy_to_bucket(image_path, bucket_dir, self.overwrite_var.get())
+        r["final_bucket"] = bucket_name
+        self.routed_count += 1
+        self.bucket_counts[bucket_name] = self.bucket_counts.get(bucket_name, 0) + 1
+
+        if bucket_name == "Keep":
+            self.keeper_paths.append(copied)
+
+        self.app.log(
+            f"Pipeline Route {self.review_index + 1}/{len(self.results)}: "
+            f"{image_path.name} -> {bucket_name}"
+        )
 
         self.review_index += 1
         self.app.root.after(1, self._step)
@@ -421,7 +450,13 @@ class PipelineTool:
         if self.original_active_tool in self.app.tools:
             self.app.set_active_tool(self.original_active_tool)
 
-        self.app.log("Pipeline: full trial complete")
+        counts = dict(self.bucket_counts)
+        total_output = sum(counts.values())
+        self.app.log(
+            f"Pipeline: full trial complete. Keep={counts['Keep']} Maybe={counts['Maybe']} "
+            f"Reject={counts['Reject']} Reject-Bursts={counts['Reject-Bursts']} total={total_output}"
+        )
+
         messagebox.showinfo("Full Trial Complete", f"Processed {len(self.images)} images.")
 
     def _finish_cancelled(self):
