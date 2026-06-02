@@ -301,7 +301,7 @@ class AICullTool:
 
         self.stop_button = tk.Button(
             self.panel,
-            text="Stop Batch Run",
+            text="Stop Current Operation",
             command=self.stop_auto_cull,
             state="disabled",
             bg="#8b1e1e",
@@ -1917,6 +1917,9 @@ class AICullTool:
                 burst_updates["burst_vl_selector"] = dict(item.get("burst_vl_selector", {}))
             self._put_cached_entry(image_path, burst_updates)
 
+    def _folder_batch_source_paths(self) -> list[Path]:
+        return [Path(p) for p in (self.app.state.all_image_paths or self.app.state.image_paths)]
+
     def run_burst_suppression_input_folder(self):
         if self.auto_running:
             self.app.log("AI Cull: another batch job is already running.")
@@ -1930,7 +1933,7 @@ class AICullTool:
             self.app.log("AI Cull: loading images from input folder...")
             self.app.start_batch()
 
-        self.auto_images = [Path(p) for p in (self.app.state.all_image_paths or self.app.state.image_paths)]
+        self.auto_images = self._folder_batch_source_paths()
         if not self.auto_images:
             self.app.log("AI Cull: no images found in input folder.")
             return
@@ -2279,7 +2282,7 @@ class AICullTool:
         if self.stop_button is not None:
             self.stop_button.config(state="normal")
 
-        total_folder_images = len(self.app.state.all_image_paths or self.app.state.image_paths)
+        total_folder_images = len(self._folder_batch_source_paths())
         self.app.log(
             f"AI Cull: starting auto cull on {len(self.auto_images)} image(s) "
             f"(current browser set; folder total={total_folder_images}. "

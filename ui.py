@@ -335,7 +335,7 @@ class MainWindow:
     def set_thumbnail_paths(self, paths: list[Path], labels: list[str] | None = None):
         self.thumb_list.delete(0, "end")
         for idx, path in enumerate(paths):
-            label = labels[idx] if labels and idx < len(labels) else path.name
+            label = labels[idx] if labels is not None and idx < len(labels) else path.name
             self.thumb_list.insert("end", label)
 
     def highlight_thumbnail_index(self, index: int):

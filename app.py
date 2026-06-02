@@ -189,7 +189,7 @@ class SportsToolkitApp:
             self.current_manual_boxes = []
             self.current_af_points = []
             self.current_af_boxes = []
-            self.ui.set_thumbnail_paths([], labels=[])
+            self.ui.set_thumbnail_paths([])
             self.ui.clear_image()
             self.ui.clear_debug_views()
             self._refresh_header_info()
