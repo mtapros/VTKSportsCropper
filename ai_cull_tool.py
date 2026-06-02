@@ -91,6 +91,8 @@ class AICullTool:
     ]
 
     VL_TARGET_LONG_EDGE = 1024
+    MAX_VL_BURST_CANDIDATES = 6
+    VL_BURST_SCORE_TIE_THRESHOLD = 8.0
 
     def __init__(self, app):
         self.app = app
@@ -1559,7 +1561,7 @@ class AICullTool:
                 dt_value = exif.get(36867) or exif.get(36868) or exif.get(306)
                 if dt_value:
                     base = str(dt_value).strip()
-                    dt = datetime.strptime(base, "%Y:%m:%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                    dt = datetime.strptime(base, "%Y:%m:%d %H:%M:%S")
                     frac = 0.0
                     subsec = exif.get(37521)
                     if subsec is not None:
@@ -1584,6 +1586,7 @@ class AICullTool:
         current: list[Path] = []
         prev_ts: float | None = None
         prev_source: str | None = None
+        prev_path: Path | None = None
 
         for path in ordered_paths:
             ts, source = self._extract_capture_timestamp(Path(path))
@@ -1591,13 +1594,15 @@ class AICullTool:
                 current = [Path(path)]
                 prev_ts = ts
                 prev_source = source
+                prev_path = Path(path)
                 continue
 
             delta = ts - float(prev_ts or 0.0)
             same_burst = False
             if delta >= 0:
                 if source == "mtime" and prev_source == "mtime" and delta == 0:
-                    same_burst = False
+                    # Avoid grouping unrelated files with identical mtime when EXIF is unavailable.
+                    same_burst = self._looks_like_sequential_burst_names(prev_path, Path(path))
                 else:
                     same_burst = delta <= threshold_sec
 
@@ -1609,11 +1614,45 @@ class AICullTool:
 
             prev_ts = ts
             prev_source = source
+            prev_path = Path(path)
 
         if current:
             bursts.append(current)
 
         return bursts
+
+    def _looks_like_sequential_burst_names(self, previous_path: Path | None, current_path: Path) -> bool:
+        if previous_path is None:
+            return False
+
+        prev_stem = previous_path.stem
+        curr_stem = current_path.stem
+
+        prev_digits = ""
+        i = len(prev_stem) - 1
+        while i >= 0 and prev_stem[i].isdigit():
+            prev_digits = prev_stem[i] + prev_digits
+            i -= 1
+
+        curr_digits = ""
+        j = len(curr_stem) - 1
+        while j >= 0 and curr_stem[j].isdigit():
+            curr_digits = curr_stem[j] + curr_digits
+            j -= 1
+
+        if not prev_digits or not curr_digits:
+            return False
+
+        prev_prefix = prev_stem[: len(prev_stem) - len(prev_digits)]
+        curr_prefix = curr_stem[: len(curr_stem) - len(curr_digits)]
+        if prev_prefix != curr_prefix:
+            return False
+
+        try:
+            delta = int(curr_digits) - int(prev_digits)
+        except Exception:
+            return False
+        return 0 < delta <= 3
 
     def _rank_burst_candidates(self, burst_results: list[dict]) -> list[dict]:
         def key(item: dict) -> tuple[float, float, float, float, float]:
@@ -1629,7 +1668,7 @@ class AICullTool:
     def _burst_vl_candidates(self, ranked: list[dict], keep_per_burst: int) -> list[dict]:
         plausible = [r for r in ranked if str(r.get("decision", "Reject")) in {"Keep", "Maybe"}]
         if len(plausible) >= 2:
-            return plausible[:6]
+            return plausible[: self.MAX_VL_BURST_CANDIDATES]
 
         if len(ranked) <= max(1, keep_per_burst):
             return []
@@ -1640,10 +1679,11 @@ class AICullTool:
 
         score_a = float(ranked[cutoff - 1].get("score", 0.0))
         score_b = float(ranked[cutoff].get("score", 0.0))
-        if abs(score_a - score_b) > 8.0:
+        # Only call VL when the heuristic scores at the keep/reject boundary are close.
+        if abs(score_a - score_b) > self.VL_BURST_SCORE_TIE_THRESHOLD:
             return []
 
-        return ranked[: min(6, cutoff + 2)]
+        return ranked[: min(self.MAX_VL_BURST_CANDIDATES, cutoff + 2)]
 
     def _resolve_vl_frame_choice(self, value: str, candidates: list[dict]) -> dict | None:
         candidate_by_name: dict[str, dict] = {}
