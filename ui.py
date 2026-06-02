@@ -332,10 +332,11 @@ class MainWindow:
         self.log_console.config(state="disabled")
         self.status_var.set(message)
 
-    def set_thumbnail_paths(self, paths: list[Path]):
+    def set_thumbnail_paths(self, paths: list[Path], labels: list[str] | None = None):
         self.thumb_list.delete(0, "end")
-        for path in paths:
-            self.thumb_list.insert("end", path.name)
+        for idx, path in enumerate(paths):
+            label = labels[idx] if labels and idx < len(labels) else path.name
+            self.thumb_list.insert("end", label)
 
     def highlight_thumbnail_index(self, index: int):
         self.thumb_list.selection_clear(0, "end")

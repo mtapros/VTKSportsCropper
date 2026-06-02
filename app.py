@@ -121,6 +121,7 @@ class SportsToolkitApp:
 
     def _auto_load_input_folder(self):
         if not self.state.input_folder:
+            self.state.all_image_paths = []
             self.state.image_paths = []
             self.state.current_index = 0
             self.state.current_image_path = None
@@ -134,10 +135,8 @@ class SportsToolkitApp:
             self.ui.clear_debug_views()
             self._refresh_header_info()
             return
-
         paths = self.image_repo.list_images(self.state.input_folder)
-        self.state.image_paths = paths
-        self.state.current_index = 0
+        self.state.all_image_paths = list(paths)
 
         if not paths:
             self.current_image = None
@@ -153,9 +152,57 @@ class SportsToolkitApp:
             self.log("No images found in selected input folder.")
             return
 
-        self.ui.set_thumbnail_paths(paths)
-        self._refresh_header_info()
+        self.refresh_image_browser()
         self.log(f"Loaded {len(paths)} image(s) from input folder.")
+
+    def refresh_image_browser(self):
+        full_paths = list(self.state.all_image_paths)
+        if not full_paths:
+            self.state.image_paths = []
+            self.state.current_index = 0
+            self.state.current_image_path = None
+            self.current_image = None
+            self.current_overlay_boxes = []
+            self.current_manual_boxes = []
+            self.current_af_points = []
+            self.current_af_boxes = []
+            self.ui.set_thumbnail_paths([])
+            self.ui.clear_image()
+            self.ui.clear_debug_views()
+            self._refresh_header_info()
+            return
+
+        visible_paths = list(full_paths)
+        labels = None
+        ai_cull_tool = self.tools.get("ai_cull")
+        if ai_cull_tool and hasattr(ai_cull_tool, "get_folder_browser_state"):
+            visible_paths, labels = ai_cull_tool.get_folder_browser_state(full_paths)
+
+        current_path = self.state.current_image_path
+        self.state.image_paths = list(visible_paths)
+
+        if not self.state.image_paths:
+            self.state.current_index = 0
+            self.state.current_image_path = None
+            self.current_image = None
+            self.current_overlay_boxes = []
+            self.current_manual_boxes = []
+            self.current_af_points = []
+            self.current_af_boxes = []
+            self.ui.set_thumbnail_paths([], labels=[])
+            self.ui.clear_image()
+            self.ui.clear_debug_views()
+            self._refresh_header_info()
+            self.log("All images are currently hidden by burst suppression.")
+            return
+
+        if current_path in self.state.image_paths:
+            self.state.current_index = self.state.image_paths.index(current_path)
+        elif self.state.current_index >= len(self.state.image_paths):
+            self.state.current_index = 0
+
+        self.ui.set_thumbnail_paths(self.state.image_paths, labels=labels)
+        self._refresh_header_info()
         self.load_current_image()
 
     def set_output_folder(self, folder: str):
