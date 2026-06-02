@@ -218,7 +218,7 @@ class LMStudioClient:
         max_tokens: int = 700,
     ) -> dict:
         if not frames:
-            raise ValueError("No burst frames were provided.")
+            raise ValueError("select_burst_best_frame: no burst frames were provided.")
 
         if str(rubric_name).strip().lower() == "dance":
             emphasis = (
@@ -266,13 +266,13 @@ class LMStudioClient:
             }
         ]
 
-        for frame in frames:
+        for index, frame in enumerate(frames, start=1):
             frame_id = str(frame.get("frame_id", "")).strip()
             if not frame_id:
-                raise ValueError("Each burst frame must include a frame_id.")
+                raise ValueError(f"select_burst_best_frame: frame #{index} is missing frame_id.")
             image_path = frame.get("image_path")
             if not image_path:
-                raise ValueError(f"Burst frame {frame_id!r} is missing image_path.")
+                raise ValueError(f"select_burst_best_frame: frame {frame_id!r} is missing image_path.")
             filename = str(frame.get("filename", "")).strip() or Path(image_path).name
             decision = str(frame.get("decision", "")).strip() or "Unknown"
             score = float(frame.get("heuristic_score", 0.0))

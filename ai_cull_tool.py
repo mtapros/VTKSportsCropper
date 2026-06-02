@@ -750,7 +750,8 @@ class AICullTool:
         if not ordered_paths:
             return []
 
-        fps = max(0.1, float(burst_fps or 0.0))
+        fps_value = float(burst_fps or 0.0)
+        fps = fps_value if fps_value > 0 else 8.0
         max_gap_seconds = max(0.05, (1.0 / fps) * 1.5)
 
         bursts: list[list[Path]] = []
@@ -761,8 +762,9 @@ class AICullTool:
             image_path = Path(path)
             try:
                 current_mtime = float(image_path.stat().st_mtime)
-            except Exception:
+            except Exception as exc:
                 current_mtime = None
+                self.app.log(f"AI Cull burst grouping: failed reading mtime for {image_path.name}: {exc}")
 
             if not current_burst:
                 current_burst = [image_path]
@@ -838,7 +840,7 @@ class AICullTool:
             return True
 
         top_score = float(candidates[0].get("score", 0.0))
-        next_score = float(candidates[min(len(candidates) - 1, keep_per_burst)].get("score", 0.0))
+        next_score = float(candidates[keep_per_burst].get("score", 0.0))
         return (top_score - next_score) <= self.BURST_VL_SCORE_GAP
 
     def _select_burst_winners_with_vl(self, ranked: list[dict], keep_per_burst: int) -> tuple[list[dict], dict]:
@@ -878,7 +880,10 @@ class AICullTool:
 
         best_frame = str(selection.get("best_frame", "")).strip()
         if best_frame not in frame_map:
-            raise ValueError(f"VL burst selector returned invalid best_frame: {best_frame!r}")
+            raise ValueError(
+                f"VL burst selector returned invalid best_frame: {best_frame!r}. "
+                f"Expected one of: {sorted(frame_map.keys())}"
+            )
 
         ordered: list[dict] = [frame_map[best_frame]]
         seen_paths = {Path(frame_map[best_frame]["path"])}
