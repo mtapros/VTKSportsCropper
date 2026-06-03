@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import re
 from pathlib import Path
 from urllib import error, request
 
@@ -216,25 +217,39 @@ class LMStudioClient:
             return "\n".join(p for p in parts if p)
         return json.dumps(response_content, indent=2)
 
+    def _strip_markdown_code_fences(self, text: str) -> tuple[str, list[str]]:
+        raw = text or ""
+        stripped = raw.strip()
+        fenced_blocks = re.findall(r"```(?:json)?\s*(.*?)```", stripped, flags=re.IGNORECASE | re.DOTALL)
+        candidates = [block.strip() for block in fenced_blocks if block and block.strip()]
+        if candidates:
+            return candidates[0], candidates
+        return stripped, []
+
     def _extract_json_object(self, text: str) -> dict:
-        text = (text or "").strip()
-        if not text:
-            raise ValueError("Empty response")
+        raw_text = text or ""
+        stripped_text, fenced_candidates = self._strip_markdown_code_fences(raw_text)
+        candidates = [stripped_text, raw_text.strip()] + fenced_candidates
+        candidates = [c for c in candidates if c]
 
-        try:
-            parsed = json.loads(text)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
+        decoder = json.JSONDecoder()
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
 
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            candidate = text[start:end + 1]
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return parsed
+            for idx, ch in enumerate(candidate):
+                if ch != "{":
+                    continue
+                try:
+                    parsed, _ = decoder.raw_decode(candidate[idx:])
+                except Exception:
+                    continue
+                if isinstance(parsed, dict):
+                    return parsed
 
         raise ValueError("No valid JSON object found in response")
 
@@ -248,10 +263,8 @@ class LMStudioClient:
         system_prompt = (
             "You are a dance recital photo culling assistant.\n\n"
             "Evaluate the image for keeper quality for dance recital delivery.\n\n"
-            "Return only valid JSON.\n"
-            "Do not use markdown.\n"
-            "Do not include code fences.\n"
-            "Do not include any text before or after the JSON.\n\n"
+            "Return exactly one valid JSON object only.\n"
+            "No markdown, no code fences, no extra text before or after JSON.\n\n"
             "Use exactly these keys:\n"
             "- sharpness\n"
             "- subject_visibility\n"
@@ -291,7 +304,7 @@ class LMStudioClient:
         )
 
         user_prompt = (
-            "Evaluate this dance recital image using the required rubric.\n\n"
+            "Evaluate this dance recital image using the required rubric.\n"
             "Focus on:\n"
             "- whether the dancer is sharp and clearly visible\n"
             "- whether the face is visible\n"
@@ -299,8 +312,8 @@ class LMStudioClient:
             "- whether the full body, feet, and hands are visible\n"
             "- whether the pose is clean and aesthetically usable\n"
             "- whether the moment is strong enough to keep\n"
-            "- whether the composition is clean enough for delivery\n\n"
-            "Return only valid JSON."
+            "- whether the composition is clean enough for delivery\n"
+            "Output exactly one JSON object and nothing else."
         )
 
         text = self.vision_chat_text(
@@ -330,7 +343,7 @@ class LMStudioClient:
             "You are a sports burst-frame selector.\n"
             "You are given multiple near-duplicate frames from one burst.\n"
             "Choose the best deliverable frame and optional alternates.\n\n"
-            "Return only valid JSON (no markdown, no prose outside JSON) with exactly these keys:\n"
+            "Return exactly one JSON object only (no markdown, no prose outside JSON) with exactly these keys:\n"
             "- best_frame\n"
             "- alternates\n"
             "- rejects\n"
@@ -349,7 +362,8 @@ class LMStudioClient:
         user_prompt = (
             "Select the best frame from this burst and optional alternates.\n"
             "Only use filenames from this list:\n"
-            f"{frame_list_text}"
+            f"{frame_list_text}\n"
+            "Output exactly one JSON object and nothing else."
         )
 
         text = self.vision_chat_text_multi(
@@ -386,7 +400,7 @@ class LMStudioClient:
             "- group_static_pose\n"
             "- action\n"
             "- unknown\n\n"
-            "Return ONLY valid JSON (no markdown, no extra text) with exactly these keys:\n"
+            "Return EXACTLY one valid JSON object (no markdown, no code fences, no extra text) with exactly these keys:\n"
             "- scene_type\n"
             "- is_group_pose\n"
             "- is_static_pose\n"
@@ -404,7 +418,7 @@ class LMStudioClient:
 
         user_prompt = (
             "Classify whether this dance recital frame is intro pose, finale pose, group static pose, or action.\n"
-            "Return only the required JSON."
+            "Output exactly one JSON object using the required keys only."
         )
 
         text = self.vision_chat_text(
@@ -415,7 +429,20 @@ class LMStudioClient:
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        parsed = self._extract_json_object(text)
+        try:
+            parsed = self._extract_json_object(text)
+        except Exception as exc:
+            raw_excerpt = text.strip().replace("\n", "\\n")[:700]
+            return {
+                "scene_type": "unknown",
+                "is_group_pose": False,
+                "is_static_pose": False,
+                "should_keep_full_frame": False,
+                "should_avoid_subject_crop": False,
+                "reason": f"parse_error: {exc}",
+                "confidence": 0.0,
+                "raw_response_excerpt": raw_excerpt,
+            }
 
         scene_type = str(parsed.get("scene_type", "unknown")).strip().lower()
         if scene_type not in self.SCENE_TYPES:
