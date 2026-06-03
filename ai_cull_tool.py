@@ -287,6 +287,11 @@ class AICullTool:
             return True
         return "dance" in profile.name.lower()
 
+    def _get_loaded_image_paths(self) -> list:
+        all_paths = getattr(self.app.state, "all_image_paths", None)
+        visible_paths = getattr(self.app.state, "image_paths", None)
+        return list(all_paths or visible_paths or [])
+
     def _sync_folder_and_loaded_state(self):
         folder = self.app.state.input_folder
         folder_key = str(folder.resolve()) if folder is not None else None
@@ -301,9 +306,7 @@ class AICullTool:
             self.input_folder_var.set("Input Folder: —")
         else:
             self.input_folder_var.set(f"Input Folder: {folder}")
-        all_paths = getattr(self.app.state, "all_image_paths", None)
-        visible_paths = getattr(self.app.state, "image_paths", None)
-        self.loaded_image_count = len(all_paths or visible_paths or [])
+        self.loaded_image_count = len(self._get_loaded_image_paths())
         self.loaded_count_var.set(f"Loaded: {self.loaded_image_count} images")
         self._refresh_accounting_labels()
 
@@ -664,7 +667,7 @@ class AICullTool:
             self.app.log("AI Cull: select an input folder first.")
             return None
         self._sync_folder_and_loaded_state()
-        if not (getattr(self.app.state, "all_image_paths", None) or getattr(self.app.state, "image_paths", None)):
+        if not self._get_loaded_image_paths():
             self.app.start_batch()
             self._sync_folder_and_loaded_state()
         paths = self._folder_batch_source_paths()
@@ -2401,9 +2404,7 @@ class AICullTool:
         self._persist_burst_suppression_results(results)
 
     def _folder_batch_source_paths(self) -> list[Path]:
-        all_paths = getattr(self.app.state, "all_image_paths", None)
-        visible_paths = getattr(self.app.state, "image_paths", None)
-        return [Path(p) for p in (all_paths or visible_paths or [])]
+        return [Path(p) for p in self._get_loaded_image_paths()]
 
     def run_burst_suppression_input_folder(self):
         if self.auto_running:
@@ -2414,7 +2415,7 @@ class AICullTool:
             self.app.log("AI Cull: please select an input folder first.")
             return
 
-        if not (getattr(self.app.state, "all_image_paths", None) or getattr(self.app.state, "image_paths", None)):
+        if not self._get_loaded_image_paths():
             self.app.log("AI Cull: loading images from input folder...")
             self.app.start_batch()
 
@@ -2485,6 +2486,13 @@ class AICullTool:
         self._log_current_burst_state()
 
     def _run_current_image_analysis(self):
+        """Run expensive Florence/VL analysis on the current image.
+
+        Unlike on_image_changed() which is lightweight and runs on every image
+        selection, this method performs the heavy object detection and vision
+        scoring. It should only be called when the user explicitly requests
+        analysis (e.g. via the Rerun Current Image button or Run All).
+        """
         if self.app.current_image is None:
             return
 
@@ -2816,7 +2824,7 @@ class AICullTool:
         self._sync_folder_and_loaded_state()
         self._update_vision_warning()
 
-        if not (getattr(self.app.state, "all_image_paths", None) or getattr(self.app.state, "image_paths", None)):
+        if not self._get_loaded_image_paths():
             self.app.log("AI Cull: loading images from input folder...")
             self.app.start_batch()
             self._sync_folder_and_loaded_state()
