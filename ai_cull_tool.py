@@ -104,6 +104,7 @@ class AICullTool:
     VL_BURST_MAX_TEMPERATURE = 0.2
     VL_BURST_MIN_TOKENS = 256
     VL_BURST_MAX_TOKENS = 450
+    MAX_BURST_THUMBNAILS = 6
 
     def __init__(self, app):
         self.app = app
@@ -780,27 +781,42 @@ class AICullTool:
         }
         return summary, burst_groups, removed_paths, remaining_paths
 
-    def _persist_burst_evaluation_cache(self, all_paths: list[Path], burst_groups: list[list[Path]], removed_paths: set[str], keep_per_burst: int):
+    def _persist_burst_evaluation_cache(
+        self,
+        all_paths: list[Path],
+        burst_groups: list[list[Path]],
+        removed_paths: set[str],
+        keep_per_burst: int,
+        vl_winners: "dict[int, list[Path]] | None" = None,
+        vl_metas: "dict[int, dict] | None" = None,
+    ):
         grouped_paths: set[Path] = set()
         for idx, group in enumerate(burst_groups, start=1):
-            kept_paths = [str(p) for p in group[:max(1, keep_per_burst)]]
+            if vl_winners and idx in vl_winners:
+                kept_paths = [str(p) for p in vl_winners[idx]]
+                vl_used = True
+                vl_meta = (vl_metas or {}).get(idx, {})
+            else:
+                kept_paths = [str(p) for p in group[:max(1, keep_per_burst)]]
+                vl_used = False
+                vl_meta = {}
             for rank, path in enumerate(group, start=1):
                 p = Path(path)
                 grouped_paths.add(p)
                 resolved = str(p.resolve())
-                self._put_cached_entry(
-                    p,
-                    {
-                        "burst_group_id": f"burst_{idx:04d}",
-                        "burst_rank": rank,
-                        "burst_size": len(group),
-                        "burst_suppressed": resolved in removed_paths,
-                        "burst_winner_paths": kept_paths,
-                        "burst_vl_selector_used": False,
-                        "burst_keep_target": max(1, keep_per_burst),
-                        "burst_conservative_scene_mode": False,
-                    },
-                )
+                entry: dict = {
+                    "burst_group_id": f"burst_{idx:04d}",
+                    "burst_rank": rank,
+                    "burst_size": len(group),
+                    "burst_suppressed": resolved in removed_paths,
+                    "burst_winner_paths": kept_paths,
+                    "burst_vl_selector_used": vl_used,
+                    "burst_keep_target": max(1, keep_per_burst),
+                    "burst_conservative_scene_mode": False,
+                }
+                if vl_meta:
+                    entry["burst_vl_selector"] = vl_meta
+                self._put_cached_entry(p, entry)
         self._persist_non_burst_defaults(all_paths, grouped_paths)
 
     def evaluate_bursts(self):
@@ -823,14 +839,33 @@ class AICullTool:
         fps = float(self.burst_fps_var.get().strip() or "8")
         keep_per_burst = int(self.keep_per_burst_var.get().strip() or "1")
         enable_burst = bool(self.enable_burst_var.get())
+        use_vl_tiebreaker = bool(self.use_vl_burst_tiebreaker_var.get())
         self.auto_cancel_requested = False
         self._cancel_event.clear()
         self._set_running_state(True, "evaluate_bursts")
 
         def worker():
             try:
-                summary, burst_groups, removed_paths, remaining_paths = self._compute_burst_summary(paths, fps, keep_per_burst, enable_burst)
-                self._worker_queue.put(("burst_done", paths, fps, keep_per_burst, summary, burst_groups, removed_paths, remaining_paths))
+                if use_vl_tiebreaker and enable_burst:
+                    summary, burst_groups, removed_paths, remaining_paths, vl_winners, vl_metas = (
+                        self._run_vl_burst_evaluation(paths, fps, keep_per_burst)
+                    )
+                    self._worker_queue.put((
+                        "burst_done",
+                        paths, fps, keep_per_burst,
+                        summary, burst_groups, removed_paths, remaining_paths,
+                        vl_winners, vl_metas,
+                    ))
+                else:
+                    summary, burst_groups, removed_paths, remaining_paths = self._compute_burst_summary(
+                        paths, fps, keep_per_burst, enable_burst
+                    )
+                    self._worker_queue.put((
+                        "burst_done",
+                        paths, fps, keep_per_burst,
+                        summary, burst_groups, removed_paths, remaining_paths,
+                        None, None,
+                    ))
             except Exception as exc:
                 self._worker_queue.put(("burst_error", str(exc)))
 
@@ -2471,6 +2506,28 @@ class AICullTool:
 
         return self._resolve_vl_frame_choice(raw, round_items)
 
+    def _build_burst_group_thumbnail_composite(self, group_paths: list[Path]) -> "Image.Image | None":
+        """Build a horizontal thumbnail strip for a burst group to display during evaluation."""
+        if not group_paths:
+            return None
+        thumb_w = 240
+        thumb_h = 180
+        gap = 6
+        n = min(len(group_paths), self.MAX_BURST_THUMBNAILS)
+        canvas_w = n * thumb_w + (n + 1) * gap
+        canvas_h = thumb_h + 2 * gap
+        canvas = Image.new("RGB", (canvas_w, canvas_h), (28, 28, 28))
+        for i, path in enumerate(group_paths[:n]):
+            try:
+                img = self._load_rgb_image(path)
+                img.thumbnail((thumb_w, thumb_h), Image.LANCZOS)
+                x = gap + i * (thumb_w + gap) + (thumb_w - img.width) // 2
+                y = gap + (thumb_h - img.height) // 2
+                canvas.paste(img, (x, y))
+            except Exception:
+                pass
+        return canvas
+
     def _burst_round_layout(self, count: int) -> tuple[int, int]:
         if count <= 2:
             return (2, 1)
@@ -2737,6 +2794,88 @@ class AICullTool:
         meta["confidence"] = max(0.0, min(1.0, avg_confidence))
 
         return chosen[:keep_per_burst], meta
+
+    def _run_vl_burst_evaluation(
+        self,
+        paths: list[Path],
+        fps: float,
+        keep_per_burst: int,
+    ) -> tuple[dict, list[list[Path]], set[str], list[Path], dict, dict]:
+        """Detect burst groups and select winners via VL tournament, reporting progress via the worker queue.
+
+        Returns (summary, burst_groups, removed_paths, remaining_paths, vl_winners, vl_metas).
+        vl_winners maps 1-based group index -> list[Path] of selected winner paths.
+        vl_metas  maps 1-based group index -> VL metadata dict for that group.
+        """
+        groups = self._build_bursts(paths, fps)
+        burst_groups = [g for g in groups if len(g) > 1]
+        total_burst_groups = len(burst_groups)
+
+        self._worker_queue.put(("burst_scan_started", total_burst_groups))
+
+        vl_winners: dict[int, list[Path]] = {}
+        vl_metas: dict[int, dict] = {}
+        removed_paths: set[str] = set()
+        # _select_burst_winners_with_vl guards on config["use_vl_burst_tiebreaker"], so we must
+        # pass this explicitly even though the calling context already established VL usage.
+        vl_config = {"use_vl_burst_tiebreaker": True}
+
+        for group_idx, group in enumerate(burst_groups, start=1):
+            if self._cancel_event.is_set():
+                break
+
+            group_paths_str = [str(p) for p in group]
+            preview_image = None
+            try:
+                preview_image = self._build_burst_group_thumbnail_composite(group)
+            except Exception:
+                pass
+            self._worker_queue.put(("burst_group_start", group_idx, total_burst_groups, group_paths_str, preview_image))
+
+            burst_items = [{"path": str(p)} for p in group]
+            winners, vl_meta = self._select_burst_winners_with_vl(burst_items, keep_per_burst, vl_config)
+
+            if winners:
+                winner_paths: list[Path] = [Path(w["path"]) for w in winners]
+            else:
+                winner_paths = list(group[:max(1, keep_per_burst)])
+
+            vl_winners[group_idx] = winner_paths
+            vl_metas[group_idx] = vl_meta if vl_meta else {}
+
+            winner_set = {str(Path(p).resolve()) for p in winner_paths}
+            for p in group:
+                if str(Path(p).resolve()) not in winner_set:
+                    removed_paths.add(str(Path(p).resolve()))
+
+            grid_image = None
+            if vl_meta and vl_meta.get("rounds"):
+                last_round = vl_meta["rounds"][-1]
+                grid_path = last_round.get("grid_path") if isinstance(last_round, dict) else None
+                if grid_path:
+                    try:
+                        grid_image = self._load_rgb_image(Path(grid_path))
+                    except Exception:
+                        pass
+            self._worker_queue.put((
+                "burst_group_done",
+                group_idx,
+                total_burst_groups,
+                [str(p) for p in winner_paths],
+                vl_meta,
+                grid_image,
+            ))
+
+        burst_images = sum(len(g) for g in burst_groups)
+        remaining_paths = [p for p in paths if str(Path(p).resolve()) not in removed_paths]
+        summary = {
+            "burst_images": burst_images,
+            "burst_images_removed": len(removed_paths),
+            "remaining_burst_images": max(0, burst_images - len(removed_paths)),
+            "non_burst_images": max(0, len(paths) - burst_images),
+            "total_remaining_images": len(remaining_paths),
+        }
+        return summary, burst_groups, removed_paths, remaining_paths, vl_winners, vl_metas
 
     def apply_burst_suppression_for_pipeline(self, results: list[dict], config: dict) -> list[dict]:
         if not results or not config.get("enable_burst", False):
@@ -3367,9 +3506,55 @@ class AICullTool:
             elif kind == "error":
                 _, image_path, message, idx, total = event
                 self.app.log(f"AI Cull {idx}/{total}: failed on {Path(image_path).name} ({message})")
+            elif kind == "burst_scan_started":
+                _, count = event
+                msg = f"Found {count} burst group(s) — running VL tournament selection…"
+                self.app.log(f"AI Cull Burst: {msg}")
+                self.burst_eval_details_var.set(msg)
+            elif kind == "burst_group_start":
+                _, idx, total, group_paths, preview_image = event
+                names = ", ".join(Path(p).name for p in group_paths[:self.MAX_BURST_THUMBNAILS])
+                suffix = f" +{len(group_paths) - self.MAX_BURST_THUMBNAILS} more" if len(group_paths) > self.MAX_BURST_THUMBNAILS else ""
+                self.app.log(
+                    f"AI Cull Burst: group {idx}/{total} — {len(group_paths)} image(s): {names}{suffix}"
+                )
+                self.burst_eval_details_var.set(
+                    f"VL tournament: group {idx}/{total} ({len(group_paths)} images)…"
+                )
+                if preview_image is not None:
+                    try:
+                        self.app.ui.show_image(preview_image)
+                    except Exception:
+                        pass
+                elif group_paths:
+                    try:
+                        self._set_worker_preview_image(Path(group_paths[0]))
+                    except Exception:
+                        pass
+            elif kind == "burst_group_done":
+                _, idx, total, winner_paths, vl_meta, grid_image = event
+                winner_names = ", ".join(Path(p).name for p in winner_paths)
+                vl_used = bool(vl_meta) and "error" not in vl_meta
+                selector_tag = " (VL)" if vl_used else " (fallback)"
+                self.app.log(
+                    f"AI Cull Burst: group {idx}/{total} winner{selector_tag}: {winner_names}"
+                )
+                self.burst_eval_details_var.set(
+                    f"Group {idx}/{total} selected{selector_tag}: {winner_names}"
+                )
+                if grid_image is not None:
+                    try:
+                        self.app.ui.show_image(grid_image)
+                    except Exception:
+                        pass
+                elif winner_paths:
+                    try:
+                        self._set_worker_preview_image(Path(winner_paths[0]))
+                    except Exception:
+                        pass
             elif kind == "burst_done":
-                _, paths, fps, keep_per_burst, summary, burst_groups, removed_paths, remaining_paths = event
-                self._persist_burst_evaluation_cache(paths, burst_groups, removed_paths, keep_per_burst)
+                _, paths, fps, keep_per_burst, summary, burst_groups, removed_paths, remaining_paths, vl_winners, vl_metas = event
+                self._persist_burst_evaluation_cache(paths, burst_groups, removed_paths, keep_per_burst, vl_winners=vl_winners, vl_metas=vl_metas)
                 self.precomputed_burst_state = {"folder": str(self.app.state.input_folder.resolve()), "fps": fps, "groups": [[str(p) for p in g] for g in burst_groups]}
                 self.burst_analysis_complete = True
                 self.burst_summary = summary
@@ -3380,8 +3565,9 @@ class AICullTool:
                 self.app.refresh_image_browser()
                 self._refresh_accounting_labels()
                 self._finish_auto_cull(cancelled=False)
+                vl_tag = " (VL tournament)" if vl_winners else ""
                 self.app.log(
-                    f"AI Cull Burst Evaluate: burst={summary['burst_images']} removed={summary['burst_images_removed']} "
+                    f"AI Cull Burst Evaluate{vl_tag}: burst={summary['burst_images']} removed={summary['burst_images_removed']} "
                     f"remaining={summary['total_remaining_images']} non-burst={summary['non_burst_images']} fps={fps:.2f}"
                 )
                 if self._pending_full_workflow_after_burst:
