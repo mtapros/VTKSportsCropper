@@ -122,7 +122,7 @@ class AICullTool:
         self.enable_burst_var = tk.BooleanVar(value=True)
         self.burst_fps_var = tk.StringVar(value="8")
         self.keep_per_burst_var = tk.StringVar(value="1")
-        self.use_vl_burst_tiebreaker_var = tk.BooleanVar(value=False)
+        self.use_vl_burst_tiebreaker_var = tk.BooleanVar(value=True)
         self.hide_burst_suppressed_var = tk.BooleanVar(value=True)
         self.prefer_face_var = tk.BooleanVar(value=True)
         self.use_object_cull_var = tk.BooleanVar(value=True)
@@ -508,7 +508,7 @@ class AICullTool:
             "enable_burst": bool(self.enable_burst_var.get()),
             "burst_fps": float(self.burst_fps_var.get().strip() or "8"),
             "keep_per_burst": int(self.keep_per_burst_var.get().strip() or "1"),
-            "use_vl_burst_tiebreaker": bool(self.use_vl_burst_tiebreaker_var.get()),
+            "use_vl_burst_tiebreaker": True,
             "prefer_face": bool(self.prefer_face_var.get()),
             "sport_type": getattr(profile, "sport_type", "generic"),
             "use_object_cull": bool(self.use_object_cull_var.get()),
@@ -839,14 +839,13 @@ class AICullTool:
         fps = float(self.burst_fps_var.get().strip() or "8")
         keep_per_burst = int(self.keep_per_burst_var.get().strip() or "1")
         enable_burst = bool(self.enable_burst_var.get())
-        use_vl_tiebreaker = bool(self.use_vl_burst_tiebreaker_var.get())
         self.auto_cancel_requested = False
         self._cancel_event.clear()
         self._set_running_state(True, "evaluate_bursts")
 
         def worker():
             try:
-                if use_vl_tiebreaker and enable_burst:
+                if enable_burst:
                     summary, burst_groups, removed_paths, remaining_paths, vl_winners, vl_metas = (
                         self._run_vl_burst_evaluation(paths, fps, keep_per_burst)
                     )
@@ -912,8 +911,9 @@ class AICullTool:
         tk.Entry(win, textvariable=self.keep_per_burst_var).pack(fill="x", **pad)
         tk.Checkbutton(
             win,
-            text="Use VL Burst Tie-Breaker",
+            text="Use VL Burst Tournament (always on)",
             variable=self.use_vl_burst_tiebreaker_var,
+            state="disabled",
             bg="#2a2a2a",
             fg="white",
             selectcolor="#444",
@@ -2736,9 +2736,6 @@ class AICullTool:
         keep_per_burst: int,
         config: dict,
     ) -> tuple[list[dict] | None, dict]:
-        if not bool(config.get("use_vl_burst_tiebreaker", False)):
-            return None, {}
-
         candidates = self._burst_vl_candidates(burst_results, keep_per_burst)
         if len(candidates) < 2:
             return None, {}
@@ -2885,6 +2882,9 @@ class AICullTool:
         ordered_paths = [Path(r["path"]) for r in results]
         bursts = self._resolve_burst_groups(ordered_paths, config)
         keep_per_burst = max(1, int(config.get("keep_per_burst", 1)))
+        total_burst_groups = sum(1 for g in bursts if len(g) > 1)
+        self.app.log(f"AI Cull Burst: Found {total_burst_groups} burst group(s) — running VL tournament selection…")
+        burst_group_progress = 0
 
         for burst_index, burst_paths in enumerate(bursts, start=1):
             burst_results = [path_to_result[p] for p in burst_paths if p in path_to_result]
@@ -2892,6 +2892,29 @@ class AICullTool:
                 for item in burst_results:
                     item.update(self._default_burst_metadata_updates())
                 continue
+            burst_group_progress += 1
+            group_paths = [Path(item["path"]) for item in burst_results]
+            group_paths_str = [str(p) for p in group_paths]
+            names = ", ".join(p.name for p in group_paths[:self.MAX_BURST_THUMBNAILS])
+            suffix = f" +{len(group_paths) - self.MAX_BURST_THUMBNAILS} more" if len(group_paths) > self.MAX_BURST_THUMBNAILS else ""
+            self.app.log(
+                f"AI Cull Burst: group {burst_group_progress}/{total_burst_groups} — {len(group_paths)} image(s): {names}{suffix}"
+            )
+            preview_image = None
+            try:
+                preview_image = self._build_burst_group_thumbnail_composite(group_paths)
+            except Exception:
+                preview_image = None
+            if preview_image is not None:
+                try:
+                    self.app.ui.show_image(preview_image)
+                except Exception:
+                    pass
+            elif group_paths_str:
+                try:
+                    self._set_worker_preview_image(Path(group_paths_str[0]))
+                except Exception:
+                    pass
             ranked = self._rank_burst_candidates(burst_results)
             has_static_group_pose = any(self._scene_is_static_group_pose(item) for item in burst_results)
             keep_target = keep_per_burst
@@ -2906,6 +2929,30 @@ class AICullTool:
             winner_paths = {Path(item["path"]) for item in winners}
             winner_path_strings = [str(p) for p in sorted(winner_paths, key=lambda p: p.name.lower())]
             vl_used = bool(vl_meta) and "error" not in vl_meta
+            selector_tag = " (VL)" if vl_used else " (fallback)"
+            winner_names = ", ".join(Path(p).name for p in winner_path_strings)
+            self.app.log(
+                f"AI Cull Burst: group {burst_group_progress}/{total_burst_groups} winner{selector_tag}: {winner_names}"
+            )
+            grid_image = None
+            if vl_meta and vl_meta.get("rounds"):
+                last_round = vl_meta["rounds"][-1]
+                grid_path = last_round.get("grid_path") if isinstance(last_round, dict) else None
+                if grid_path:
+                    try:
+                        grid_image = self._load_rgb_image(Path(grid_path))
+                    except Exception:
+                        grid_image = None
+            if grid_image is not None:
+                try:
+                    self.app.ui.show_image(grid_image)
+                except Exception:
+                    pass
+            elif winner_path_strings:
+                try:
+                    self._set_worker_preview_image(Path(winner_path_strings[0]))
+                except Exception:
+                    pass
             group_id = f"burst_{burst_index:04d}"
             rank_by_path = {Path(item["path"]): rank for rank, item in enumerate(ranked, start=1)}
 
