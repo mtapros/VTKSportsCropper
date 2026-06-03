@@ -98,6 +98,12 @@ class AICullTool:
     VL_TARGET_LONG_EDGE = 1024
     MAX_VL_BURST_CANDIDATES = 6
     VL_BURST_SCORE_TIE_THRESHOLD = 8.0
+    VL_BURST_PANEL_LABELS = ("A", "B", "C", "D")
+    VL_BURST_MAX_ROUND_IMAGES = 4
+    VL_BURST_MAX_NEW_CHALLENGERS = 3
+    VL_BURST_MAX_TEMPERATURE = 0.2
+    VL_BURST_MIN_TOKENS = 256
+    VL_BURST_MAX_TOKENS = 450
 
     def __init__(self, app):
         self.app = app
@@ -2408,25 +2414,10 @@ class AICullTool:
 
         return sorted(burst_results, key=key, reverse=True)
 
-    def _burst_vl_candidates(self, ranked: list[dict], keep_per_burst: int) -> list[dict]:
-        plausible = [r for r in ranked if str(r.get("decision", "Reject")) in {"Keep", "Maybe"}]
-        if len(plausible) >= 2:
-            return plausible[: self.MAX_VL_BURST_CANDIDATES]
-
-        if len(ranked) <= max(1, keep_per_burst):
+    def _burst_vl_candidates(self, burst_results: list[dict], keep_per_burst: int) -> list[dict]:
+        if len(burst_results) <= max(1, keep_per_burst):
             return []
-
-        cutoff = max(1, keep_per_burst)
-        if cutoff >= len(ranked):
-            return []
-
-        score_a = float(ranked[cutoff - 1].get("score", 0.0))
-        score_b = float(ranked[cutoff].get("score", 0.0))
-        # Only call VL when the heuristic scores at the keep/reject boundary are close.
-        if abs(score_a - score_b) > self.VL_BURST_SCORE_TIE_THRESHOLD:
-            return []
-
-        return ranked[: min(self.MAX_VL_BURST_CANDIDATES, cutoff + 2)]
+        return list(burst_results)
 
     def _resolve_vl_frame_choice(self, value: str, candidates: list[dict]) -> dict | None:
         candidate_by_name: dict[str, dict] = {}
@@ -2455,61 +2446,295 @@ class AICullTool:
 
         return None
 
+    def _resolve_burst_panel_choice(
+        self,
+        value,
+        label_to_item: dict[str, dict],
+        round_items: list[dict],
+    ) -> dict | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+
+        normalized = raw.upper().strip()
+        if normalized in label_to_item:
+            return label_to_item[normalized]
+
+        if ":" in normalized:
+            tail = normalized.split(":", 1)[1].strip()
+            if tail in label_to_item:
+                return label_to_item[tail]
+
+        for label in label_to_item:
+            if f" {label} " in f" {normalized} ":
+                return label_to_item[label]
+
+        return self._resolve_vl_frame_choice(raw, round_items)
+
+    def _burst_round_layout(self, count: int) -> tuple[int, int]:
+        if count <= 2:
+            return (2, 1)
+        if count == 3:
+            return (3, 1)
+        return (2, 2)
+
+    def _build_burst_round_grid(
+        self,
+        round_items: list[dict],
+        round_index: int,
+    ) -> tuple[Path, dict[str, dict]]:
+        if not round_items:
+            raise ValueError("No burst round items")
+        if len(round_items) > self.VL_BURST_MAX_ROUND_IMAGES:
+            raise ValueError(f"Burst round supports at most {self.VL_BURST_MAX_ROUND_IMAGES} items")
+
+        panel_w = 560
+        panel_h = 480
+        gap = 18
+        cols, rows = self._burst_round_layout(len(round_items))
+        canvas_w = cols * panel_w + (cols + 1) * gap
+        canvas_h = rows * panel_h + (rows + 1) * gap
+        canvas = Image.new("RGB", (canvas_w, canvas_h), (18, 18, 18))
+        draw = ImageDraw.Draw(canvas, "RGBA")
+        label_font = self._font(64)
+        name_font = self._font(22)
+
+        label_to_item: dict[str, dict] = {}
+        labels = self.VL_BURST_PANEL_LABELS[: len(round_items)]
+
+        for idx, item in enumerate(round_items):
+            label = labels[idx]
+            image_path = Path(item["path"])
+            label_to_item[label] = item
+            row = idx // cols
+            col = idx % cols
+            px = gap + col * (panel_w + gap)
+            py = gap + row * (panel_h + gap)
+            panel_box = [px, py, px + panel_w, py + panel_h]
+
+            draw.rounded_rectangle(panel_box, radius=16, fill=(38, 38, 38, 255), outline=(215, 215, 215, 255), width=4)
+
+            image = self._load_rgb_image(image_path)
+            max_content_w = panel_w - 28
+            max_content_h = panel_h - 118
+            image.thumbnail((max_content_w, max_content_h), Image.LANCZOS)
+            ix = px + (panel_w - image.width) // 2
+            iy = py + 76 + (max_content_h - image.height) // 2
+            canvas.paste(image, (ix, iy))
+
+            self._draw_badge(
+                draw,
+                px + 12,
+                py + 12,
+                f"Panel {label}",
+                fill=(0, 0, 0, 235),
+                outline=(255, 255, 255, 255),
+                text_fill=(255, 255, 255, 255),
+                font=label_font,
+                pad_x=16,
+                pad_y=8,
+            )
+            self._draw_badge(
+                draw,
+                px + 12,
+                py + panel_h - 60,
+                image_path.name,
+                fill=(0, 0, 0, 220),
+                outline=(170, 170, 170, 255),
+                text_fill=(240, 240, 240, 255),
+                font=name_font,
+                pad_x=12,
+                pad_y=6,
+            )
+
+        debug_dir = self._dance_debug_dir(Path(round_items[0]["path"]))
+        grid_path = debug_dir / f"{Path(round_items[0]['path']).stem}_burst_round_{round_index:02d}.jpg"
+        canvas.save(grid_path, format="JPEG", quality=92)
+        return grid_path, label_to_item
+
+    def _run_burst_vl_round(
+        self,
+        client: LMStudioClient,
+        model: str,
+        round_items: list[dict],
+        round_index: int,
+        temperature: float,
+        max_tokens: int,
+    ) -> tuple[dict | None, dict]:
+        grid_path, label_to_item = self._build_burst_round_grid(round_items, round_index)
+        option_lines = "\n".join(
+            f"- Panel {label}: {Path(item['path']).name}"
+            for label, item in label_to_item.items()
+        )
+
+        system_prompt = (
+            "You are a sports burst-frame comparison assistant.\n"
+            "You will see one labeled comparison grid image with panels named Panel A, Panel B, Panel C, or Panel D.\n"
+            "Choose the single best deliverable frame based on sharpness, subject clarity, and strongest timing.\n"
+            "Do not use object detection metadata; judge only the visual frame quality.\n"
+            "Return EXACTLY one valid JSON object and nothing else.\n"
+            "Required JSON keys:\n"
+            "- winner_label (string, one of A/B/C/D that is present)\n"
+            "- runner_up_labels (array of zero or more labels from A/B/C/D that are present)\n"
+            "- confidence (number 0..1)\n"
+            "- reason (one short sentence)\n"
+            "No markdown. No code fences. No extra text."
+        )
+        user_prompt = (
+            "Select the best panel label from this burst round grid.\n"
+            "Valid options for this round:\n"
+            f"{option_lines}\n"
+            "Output exactly one JSON object only."
+        )
+
+        raw_text = client.vision_chat_text(
+            model=model,
+            image_path=grid_path,
+            user_prompt=user_prompt,
+            system_prompt=system_prompt,
+            temperature=min(max(0.0, temperature), self.VL_BURST_MAX_TEMPERATURE),
+            max_tokens=max(self.VL_BURST_MIN_TOKENS, min(max_tokens, self.VL_BURST_MAX_TOKENS)),
+        )
+        parsed = client._extract_json_object(raw_text)
+
+        winner = self._resolve_burst_panel_choice(parsed.get("winner_label", ""), label_to_item, round_items)
+        if winner is None:
+            winner = self._resolve_burst_panel_choice(parsed.get("best_frame", ""), label_to_item, round_items)
+        if winner is None:
+            raise ValueError(f"No valid winner label returned for burst round {round_index}: {parsed}")
+
+        runner_ups: list[str] = []
+        for value in parsed.get("runner_up_labels", []) or []:
+            pick = self._resolve_burst_panel_choice(value, label_to_item, round_items)
+            if pick is not None:
+                runner_ups.append(str(pick["path"]))
+
+        try:
+            confidence = float(parsed.get("confidence", 0.0))
+        except Exception:
+            confidence = 0.0
+
+        return winner, {
+            "round": round_index,
+            "grid_path": str(grid_path),
+            "winner_path": str(winner["path"]),
+            "runner_up_paths": runner_ups,
+            "reason": str(parsed.get("reason", "")).strip(),
+            "confidence": max(0.0, min(1.0, confidence)),
+            "candidate_map": {label: str(item["path"]) for label, item in label_to_item.items()},
+        }
+
+    def _select_single_burst_winner_via_tournament(
+        self,
+        client: LMStudioClient,
+        model: str,
+        items: list[dict],
+        start_round: int,
+        temperature: float,
+        max_tokens: int,
+    ) -> tuple[dict | None, list[dict], int]:
+        if not items:
+            return None, [], start_round
+        if len(items) == 1:
+            return items[0], [], start_round
+
+        round_index = start_round
+        round_meta: list[dict] = []
+        cursor = 0
+        chunk = items[: min(self.VL_BURST_MAX_ROUND_IMAGES, len(items))]
+
+        winner, meta = self._run_burst_vl_round(
+            client=client,
+            model=model,
+            round_items=chunk,
+            round_index=round_index,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        round_meta.append(meta)
+        cursor = len(chunk)
+        round_index += 1
+
+        while cursor < len(items):
+            opponents = items[cursor:cursor + self.VL_BURST_MAX_NEW_CHALLENGERS]
+            if not opponents:
+                break
+            winner, meta = self._run_burst_vl_round(
+                client=client,
+                model=model,
+                round_items=[winner] + opponents,
+                round_index=round_index,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            round_meta.append(meta)
+            cursor += len(opponents)
+            round_index += 1
+
+        return winner, round_meta, round_index
+
     def _select_burst_winners_with_vl(
         self,
-        ranked: list[dict],
+        burst_results: list[dict],
         keep_per_burst: int,
         config: dict,
     ) -> tuple[list[dict] | None, dict]:
         if not bool(config.get("use_vl_burst_tiebreaker", False)):
             return None, {}
 
-        candidates = self._burst_vl_candidates(ranked, keep_per_burst)
+        candidates = self._burst_vl_candidates(burst_results, keep_per_burst)
         if len(candidates) < 2:
             return None, {}
 
         try:
             base_url, model, timeout, temperature, max_tokens = self._dance_lmstudio_settings()
             client = LMStudioClient(base_url=base_url, timeout=timeout)
-            selection = client.burst_select_frames(
-                model=model,
-                image_paths=[Path(item["path"]) for item in candidates],
-                temperature=max(0.0, min(temperature, 0.4)),
-                max_tokens=max(256, min(max_tokens, 600)),
-            )
+            remaining = list(candidates)
+            chosen: list[dict] = []
+            rounds: list[dict] = []
+            round_index = 1
+            keep_target = min(max(1, int(keep_per_burst)), len(remaining))
+
+            while remaining and len(chosen) < keep_target:
+                if len(remaining) == 1:
+                    chosen.append(remaining.pop(0))
+                    break
+
+                winner, round_meta, round_index = self._select_single_burst_winner_via_tournament(
+                    client=client,
+                    model=model,
+                    items=remaining,
+                    start_round=round_index,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                if winner is None:
+                    return None, {"error": "VL burst tournament returned no winner.", "rounds": rounds}
+                chosen.append(winner)
+                rounds.extend(round_meta)
+                remaining = [item for item in remaining if item is not winner]
         except Exception as exc:
             self.app.log(f"AI Cull: VL burst tie-breaker unavailable ({exc}); using heuristic ranking.")
             return None, {"error": str(exc)}
 
-        chosen: list[dict] = []
-        best = self._resolve_vl_frame_choice(str(selection.get("best_frame", "")), candidates)
-        if best is not None:
-            chosen.append(best)
-
-        for alt in selection.get("alternates", []) or []:
-            alt_item = self._resolve_vl_frame_choice(str(alt), candidates)
-            if alt_item is not None and alt_item not in chosen:
-                chosen.append(alt_item)
-
         if not chosen:
             return None, {"error": "VL selector returned no valid frame choice."}
 
-        for fallback in ranked:
-            if len(chosen) >= keep_per_burst:
-                break
-            if fallback not in chosen:
-                chosen.append(fallback)
+        selected_paths = [str(item["path"]) for item in chosen]
+        rejected_paths = [str(item["path"]) for item in candidates if item not in chosen]
+        round_confidences = [float(r.get("confidence", 0.0)) for r in rounds if isinstance(r, dict)]
+        avg_confidence = (sum(round_confidences) / len(round_confidences)) if round_confidences else 0.0
 
         meta = {
-            "best_frame": str(selection.get("best_frame", "")),
-            "alternates": list(selection.get("alternates", []) or []),
-            "rejects": list(selection.get("rejects", []) or []),
-            "reason": str(selection.get("reason", "")),
+            "best_frame": selected_paths[0],
+            "alternates": selected_paths[1:],
+            "rejects": rejected_paths,
+            "reason": "VL tournament burst selection.",
+            "selection_mode": "vl_tournament_grid",
+            "selected_frames": selected_paths,
+            "rounds": rounds,
         }
-        try:
-            meta["confidence"] = float(selection.get("confidence", 0.0))
-        except Exception:
-            meta["confidence"] = 0.0
+        meta["confidence"] = max(0.0, min(1.0, avg_confidence))
 
         return chosen[:keep_per_burst], meta
 
@@ -2536,7 +2761,7 @@ class AICullTool:
                 # keep at least two to avoid over-suppressing composition-preserving frames.
                 keep_target = min(len(burst_results), max(keep_per_burst, MIN_STATIC_GROUP_BURST_KEEP))
 
-            winners, vl_meta = self._select_burst_winners_with_vl(ranked, keep_target, config)
+            winners, vl_meta = self._select_burst_winners_with_vl(burst_results, keep_target, config)
             if not winners:
                 winners = ranked[:keep_target]
             winner_paths = {Path(item["path"]) for item in winners}
