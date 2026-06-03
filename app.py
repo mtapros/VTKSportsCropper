@@ -156,7 +156,11 @@ class SportsToolkitApp:
         self.log(f"Loaded {len(paths)} image(s) from input folder.")
 
     def refresh_image_browser(self):
-        full_paths = self.state.all_image_paths
+        all_paths = getattr(self.state, "all_image_paths", None)
+        if all_paths is None:
+            full_paths = list(self.state.image_paths)
+        else:
+            full_paths = list(all_paths)
         if not full_paths:
             self.state.image_paths = []
             self.state.current_index = 0
