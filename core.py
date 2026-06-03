@@ -19,6 +19,8 @@ _FLORENCE_PROCESSOR = None
 _FLORENCE_MODEL = None
 _FLORENCE_DEVICE = None
 
+_LOCAL_FLORENCE_DIR = Path(__file__).resolve().parent / "models" / "florence-2-base"
+
 
 class ImageRepository:
     def list_images(self, folder: Path) -> list[Path]:
@@ -44,11 +46,25 @@ def get_florence_components():
     if _FLORENCE_PROCESSOR is not None and _FLORENCE_MODEL is not None:
         return _FLORENCE_PROCESSOR, _FLORENCE_MODEL, _FLORENCE_DEVICE
 
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    model_id = "microsoft/Florence-2-base"
+    if not _LOCAL_FLORENCE_DIR.exists():
+        raise RuntimeError(
+            f"Local Florence model folder not found: {_LOCAL_FLORENCE_DIR}"
+        )
 
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True).to(device).eval()
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+
+    print(f"[Florence] Loading processor/model from local folder: {_LOCAL_FLORENCE_DIR}")
+
+    processor = AutoProcessor.from_pretrained(
+        str(_LOCAL_FLORENCE_DIR),
+        trust_remote_code=True,
+        local_files_only=True,
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        str(_LOCAL_FLORENCE_DIR),
+        trust_remote_code=True,
+        local_files_only=True,
+    ).to(device).eval()
 
     _FLORENCE_PROCESSOR = processor
     _FLORENCE_MODEL = model
@@ -337,9 +353,6 @@ def build_crop_around_subject(subject_box: BoundingBox, img_w: int, img_h: int, 
     if half_h < req_half_h:
         half_h = req_half_h
         half_w = half_h * ratio
-
-    max_half_w_by_h = max_half_h * ratio
-    max_half_h_by_w = max_half_w / ratio
 
     if half_w > max_half_w:
         half_w = max_half_w

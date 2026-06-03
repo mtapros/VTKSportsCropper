@@ -66,7 +66,6 @@ class SportProfile:
 class AppState:
     input_folder: Optional[Path] = None
     output_folder: Optional[Path] = None
-    all_image_paths: list[Path] = field(default_factory=list)
     image_paths: list[Path] = field(default_factory=list)
     current_index: int = 0
     active_tool_id: str = "ai_crop"
