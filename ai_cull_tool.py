@@ -150,6 +150,7 @@ class AICullTool:
         self.run_full_button = None
         self.select_folder_button = None
         self.burst_button = None
+        self.burst_enable_checkbox = None
         self.evaluate_bursts_button = None
         self.use_object_checkbox = None
         self.use_vision_checkbox = None
@@ -205,16 +206,18 @@ class AICullTool:
         tk.Label(self.panel, textvariable=self.loaded_count_var, bg="#2a2a2a", fg="#c9d7ff").pack(anchor="w", padx=10, pady=(0, 6))
         ttk.Separator(self.panel, orient="horizontal").pack(fill="x", padx=10, pady=(2, 8))
 
-        self.evaluate_bursts_button = tk.Button(self.panel, text="Evaluate Bursts", command=self.evaluate_bursts)
-        self.evaluate_bursts_button.pack(fill="x", padx=10, pady=(0, 6))
-        tk.Checkbutton(
+        self.burst_enable_checkbox = tk.Checkbutton(
             self.panel,
-            text="Enable Burst Suppression",
+            text="Enable Burst Filtering",
             variable=self.enable_burst_var,
+            command=self._on_burst_enable_toggled,
             bg="#2a2a2a",
             fg="white",
             selectcolor="#444",
-        ).pack(anchor="w", **pad)
+        )
+        self.burst_enable_checkbox.pack(anchor="w", **pad)
+        self.evaluate_bursts_button = tk.Button(self.panel, text="Evaluate Bursts", command=self.evaluate_bursts)
+        self.evaluate_bursts_button.pack(fill="x", padx=10, pady=(0, 6))
         tk.Label(self.panel, text="Burst FPS Threshold", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
         tk.Entry(self.panel, textvariable=self.burst_fps_var).pack(fill="x", **pad)
         tk.Label(self.panel, text="Keep Per Burst", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
@@ -276,6 +279,7 @@ class AICullTool:
         self._sync_folder_and_loaded_state()
         self._update_vision_warning()
         self._refresh_accounting_labels()
+        self._refresh_burst_enable_controls()
         self._refresh_dynamic_sections()
         return self.panel
 
@@ -329,11 +333,21 @@ class AICullTool:
         self._refresh_vision_object_controls()
 
     def _refresh_accounting_labels(self):
-        burst_images = int(self.burst_summary.get("burst_images", 0))
-        burst_removed = int(self.burst_summary.get("burst_images_removed", 0))
-        burst_remaining = int(self.burst_summary.get("remaining_burst_images", 0))
-        non_burst = int(self.burst_summary.get("non_burst_images", 0))
-        total_remaining = int(self.burst_summary.get("total_remaining_images", 0))
+        burst_on = bool(self.enable_burst_var.get())
+
+        if burst_on:
+            burst_images = int(self.burst_summary.get("burst_images", 0))
+            burst_removed = int(self.burst_summary.get("burst_images_removed", 0))
+            burst_remaining = int(self.burst_summary.get("remaining_burst_images", 0))
+            non_burst = int(self.burst_summary.get("non_burst_images", 0))
+            total_remaining = int(self.burst_summary.get("total_remaining_images", 0))
+        else:
+            burst_images = 0
+            burst_removed = 0
+            burst_remaining = 0
+            non_burst = 0
+            total_remaining = self.loaded_image_count
+
         self.burst_accounting_var.set(
             f"Burst images = {burst_images}\n"
             f"Burst images removed = {burst_removed}\n"
@@ -342,12 +356,16 @@ class AICullTool:
             f"Total remaining images = {total_remaining}"
         )
 
-        remaining_keys = {str(Path(p).resolve()) for p in self.burst_remaining_paths}
+        if burst_on:
+            eligible_keys = {str(Path(p).resolve()) for p in self.burst_remaining_paths}
+        else:
+            eligible_keys = {str(Path(p).resolve()) for p in self._get_loaded_image_paths()}
+
         keepers = 0
         maybe = 0
         reject = 0
         for key, item in self.ai_processed_results.items():
-            if key not in remaining_keys:
+            if key not in eligible_keys:
                 continue
             decision = str(item.get("decision", "Reject"))
             if decision == "Keep":
@@ -392,6 +410,27 @@ class AICullTool:
 
     def _refresh_dynamic_sections(self):
         return
+
+    def _refresh_burst_enable_controls(self):
+        burst_on = bool(self.enable_burst_var.get())
+        if self.evaluate_bursts_button is not None:
+            self.evaluate_bursts_button.configure(state="normal" if burst_on else "disabled")
+
+    def _on_burst_enable_toggled(self):
+        self._refresh_burst_enable_controls()
+        self._refresh_accounting_labels()
+
+    def _burst_stage_ready(self) -> bool:
+        """Return True if AI cull can proceed without first running burst evaluation."""
+        if not bool(self.enable_burst_var.get()):
+            return True
+        return self.burst_analysis_complete
+
+    def _get_eligible_paths(self) -> list[Path]:
+        """Return paths eligible for AI culling (post-burst remaining, or all if burst disabled)."""
+        if not bool(self.enable_burst_var.get()):
+            return [Path(p) for p in self._get_loaded_image_paths()]
+        return [Path(p) for p in self.burst_remaining_paths]
 
     def _refresh_vision_object_controls(self):
         vision_enabled = bool(self.use_vision_cull_var.get()) and self.vision_model_loaded
@@ -3015,7 +3054,7 @@ class AICullTool:
         if not self._can_run_ai_cull():
             return
         image_path = Path(self.app.state.current_image_path)
-        if self.burst_analysis_complete and self._is_burst_rejected(image_path):
+        if bool(self.enable_burst_var.get()) and self.burst_analysis_complete and self._is_burst_rejected(image_path):
             self.app.log("AI Cull: current image is burst-rejected; skipping Run Current Image.")
             return
         self._start_ai_worker([image_path], "run_current_image")
@@ -3023,20 +3062,20 @@ class AICullTool:
     def run_cull(self):
         if not self._can_run_ai_cull():
             return
-        if not self.burst_analysis_complete:
+        if not self._burst_stage_ready():
             self.app.log("AI Cull: run Evaluate Bursts first.")
             return
-        pending = [Path(p) for p in self.burst_remaining_paths if str(Path(p).resolve()) not in self.ai_processed_results]
+        pending = [p for p in self._get_eligible_paths() if str(p.resolve()) not in self.ai_processed_results]
         self._start_ai_worker(pending, "run_cull")
 
     def run_full_workflow(self):
         if not self._can_run_ai_cull():
             return
-        if not self.burst_analysis_complete:
+        if not self._burst_stage_ready():
             self._pending_full_workflow_after_burst = True
             self.evaluate_bursts()
             return
-        pending = [Path(p) for p in self.burst_remaining_paths if str(Path(p).resolve()) not in self.ai_processed_results]
+        pending = [p for p in self._get_eligible_paths() if str(p.resolve()) not in self.ai_processed_results]
         self._start_ai_worker(pending, "run_full_workflow")
 
     def rerun(self):
