@@ -244,7 +244,7 @@ class AICullTool:
             selectcolor="#444",
         )
         self.use_object_checkbox.pack(anchor="w", **pad)
-        self.object_settings_button = tk.Button(self.panel, text="Cull by Object", command=self.cull_current_by_object)
+        self.object_settings_button = tk.Button(self.panel, text="Cull by Object", command=self.open_object_settings_window)
         self.object_settings_button.pack(fill="x", padx=10, pady=(0, 4))
         self.use_vision_checkbox = tk.Checkbutton(
             self.panel,
@@ -256,7 +256,7 @@ class AICullTool:
             selectcolor="#444",
         )
         self.use_vision_checkbox.pack(anchor="w", **pad)
-        self.vision_settings_button = tk.Button(self.panel, text="Cull by Vision", command=self.cull_current_by_vision)
+        self.vision_settings_button = tk.Button(self.panel, text="Cull by Vision", command=self.open_vision_settings_window)
         self.vision_settings_button.pack(fill="x", padx=10, pady=(0, 2))
         tk.Label(self.panel, textvariable=self.vision_warning_var, bg="#2a2a2a", fg="#ffd27f", justify="left", wraplength=320).pack(anchor="w", padx=10, pady=(0, 8))
         ttk.Separator(self.panel, orient="horizontal").pack(fill="x", padx=10, pady=(2, 8))
@@ -2065,7 +2065,7 @@ class AICullTool:
             "burst_winner_paths": [],
         }
 
-    def _evaluate_dance_full_pipeline(self, image_path: Path, config: dict) -> dict:
+    def _evaluate_dance_full_pipeline(self, image_path: Path, config: dict, progress_callback=None) -> dict:
         previous_path = self.app.state.current_image_path
         previous_image = self.app.current_image
         previous_af = list(self.app.current_af_boxes)
@@ -2076,12 +2076,16 @@ class AICullTool:
         self.current_vl_subject_reason = ""
 
         try:
+            if progress_callback is not None:
+                progress_callback("loading image")
             self.app.load_image(Path(image_path))
 
             profile = self.get_profile_data()
             prompts = [p.strip() for p in profile.prompts if p.strip()]
             detection_mode = config.get("detection_mode", "Phrase Only")
 
+            if progress_callback is not None:
+                progress_callback("running object detection")
             if detection_mode == "Phrase Only":
                 detections = self._get_phrase_only_detections_for_current_image(prompts)
             else:
@@ -2095,6 +2099,8 @@ class AICullTool:
             chosen_reason = ""
 
             if bool(config.get("use_dance_vl_subject_picker", False)) and vl_candidates:
+                if progress_callback is not None:
+                    progress_callback("running vision subject picker")
                 chosen, chosen_reason = self._select_main_dance_detection_from_candidates(
                     Path(image_path),
                     vl_candidates,
@@ -2104,6 +2110,8 @@ class AICullTool:
             img_h = self.app.current_image.height if self.app.current_image else 0
             scene_classification = self._default_scene_classification()
             if bool(config.get("use_dance_scene_classifier", False)):
+                if progress_callback is not None:
+                    progress_callback("running scene classifier")
                 try:
                     scene_classification = self._classify_scene_with_vl(Path(image_path))
                     self.app.log(
@@ -2128,6 +2136,8 @@ class AICullTool:
                     chosen, img_w, img_h, profile.main_ratio or "4:5"
                 )
 
+            if progress_callback is not None:
+                progress_callback("running vision rubric")
             result = self._evaluate_dance_with_vl(Path(image_path))
             final_score = float(result["score"]) + crop_center_penalty
             final_decision = str(result["decision"])
@@ -2166,6 +2176,9 @@ class AICullTool:
 
             return {
                 "path": Path(image_path),
+                "detections": detections,
+                "vl_candidates": vl_candidates,
+                "chosen": chosen,
                 "score": final_score,
                 "decision": final_decision,
                 "rubric": result.get("rubric", {}),
@@ -2195,15 +2208,17 @@ class AICullTool:
             self.app.current_image = previous_image
             self.app.current_af_boxes = previous_af
 
-    def evaluate_image_for_pipeline(self, image_path, config: dict) -> dict:
+    def evaluate_image_for_pipeline(self, image_path, config: dict, progress_callback=None) -> dict:
         if bool(config.get("use_dance_vl", False)):
-            return self._evaluate_dance_full_pipeline(Path(image_path), config)
+            return self._evaluate_dance_full_pipeline(Path(image_path), config, progress_callback=progress_callback)
 
         previous_path = self.app.state.current_image_path
         previous_image = self.app.current_image
         previous_af = list(self.app.current_af_boxes)
 
         try:
+            if progress_callback is not None:
+                progress_callback("loading image")
             self.app.load_image(Path(image_path))
 
             prompts = config["prompts"]
@@ -2211,6 +2226,8 @@ class AICullTool:
             use_ball_scoring = self._prompts_include_ball(prompts)
             prefer_face = config["prefer_face"]
 
+            if progress_callback is not None:
+                progress_callback("running object detection")
             if detection_mode == "Phrase Only":
                 detections = self._get_phrase_only_detections_for_current_image(prompts)
             else:
@@ -2228,6 +2245,8 @@ class AICullTool:
             img_h = self.app.current_image.height if self.app.current_image else 0
             _, crop_center_penalty = self._compute_crop_proposal(hero, img_w, img_h)
 
+            if progress_callback is not None:
+                progress_callback("scoring detections")
             score, breakdown = self._compute_keeper_score(
                 hero=hero,
                 has_af_match=has_af_match,
@@ -2241,6 +2260,8 @@ class AICullTool:
                 blur_penalty_threshold=float(config["blur_penalty_threshold"]),
                 blur_penalty_points=float(config["blur_penalty_points"]),
             )
+            if progress_callback is not None:
+                progress_callback("finalizing decision")
             decision, override_reason = self._decision_from_score(
                 score,
                 focus_score,
@@ -2916,6 +2937,105 @@ class AICullTool:
             self.current_score = score
         self._refresh_accounting_labels()
 
+    def _set_worker_preview_image(self, image_path: Path):
+        no_current_image = self.app.current_image is None
+        no_current_path = self.app.state.current_image_path is None
+        path_mismatch = (
+            not no_current_path
+            and Path(self.app.state.current_image_path).resolve() != Path(image_path).resolve()
+        )
+        if no_current_image or no_current_path or path_mismatch:
+            self.app.load_image(Path(image_path))
+        if self.app.current_image is not None:
+            self.app.ui.show_image(self.app.current_image)
+
+    def _apply_worker_result_to_preview(self, image_path: Path, result: dict):
+        target_path = Path(image_path)
+        try:
+            self._set_worker_preview_image(target_path)
+        except Exception as exc:
+            self.app.log(f"AI Cull: failed to refresh preview for {target_path.name} ({exc})")
+            return
+
+        mode = str(result.get("mode", ""))
+        if mode == "dance_vl_full_pipeline":
+            detections = list(result.get("detections") or [])
+            people = [d for d in detections if self._is_person_label(d.label)]
+            self.app.set_manual_boxes(people)
+
+            chosen = result.get("chosen")
+            selected_ids: set[int] = set()
+            overlays: list[CropBox] = []
+            if isinstance(chosen, Detection):
+                selected_ids.add(chosen.id)
+                overlays.append(CropBox(name="Dance_VL_Subject", bbox=chosen.bbox, color="#FFD400"))
+                self.current_hero_id = chosen.id
+            else:
+                self.current_hero_id = None
+
+            self.app.set_manual_selected_ids(selected_ids)
+            self.app.set_overlays(overlays)
+
+            self.current_vl_subject_reason = str(result.get("chosen_reason", "") or "")
+            self.current_vl_mismatch = bool(result.get("vl_mismatch", False))
+            vl_debug_path = result.get("vl_debug_image_path")
+            self.current_vl_debug_image_path = Path(vl_debug_path) if vl_debug_path else None
+            self.current_scene_classification = result.get("scene_classification")
+
+            if bool(self.show_dance_debug_preview_var.get()):
+                validated_chosen = chosen if isinstance(chosen, Detection) else None
+                original_preview = self._scale_image_to_long_edge(
+                    self._load_rgb_image(target_path),
+                    self.VL_TARGET_LONG_EDGE,
+                )
+                florence_preview = self._draw_florence_candidates_preview(
+                    target_path,
+                    list(result.get("vl_candidates") or []),
+                )
+                final_preview = self._draw_final_subject_preview(target_path, validated_chosen)
+                self.app.set_debug_views([
+                    ("Object Candidates", florence_preview),
+                    ("VL Input", self.current_vl_debug_image_path),
+                    ("Final Subject", final_preview),
+                    ("Original", original_preview),
+                ])
+            return
+
+        detections = list(result.get("detections") or [])
+        self.app.set_manual_boxes(detections)
+
+        hero = result.get("hero")
+        support_ball = result.get("support_ball")
+        face_det = result.get("face_det")
+        use_ball_scoring = bool(result.get("use_ball_scoring", False))
+        prefer_face = bool(result.get("prefer_face", False))
+        override_reason = str(result.get("override_reason", ""))
+
+        selected_ids: set[int] = set()
+        overlays: list[CropBox] = []
+        if isinstance(hero, Detection):
+            selected_ids.add(hero.id)
+            hero_color = "#FF3333" if override_reason == "blur_reject" else "#FFD400"
+            overlays.append(CropBox(name="Cull_Hero", bbox=hero.bbox, color=hero_color))
+            self.current_hero_id = hero.id
+        else:
+            self.current_hero_id = None
+
+        if prefer_face and isinstance(face_det, Detection):
+            selected_ids.add(face_det.id)
+            overlays.append(CropBox(name="Cull_Face", bbox=face_det.bbox, color="#00FFAA"))
+
+        if use_ball_scoring and bool(result.get("has_support_ball", False)) and isinstance(support_ball, Detection):
+            selected_ids.add(support_ball.id)
+            overlays.append(CropBox(name="Cull_Ball", bbox=support_ball.bbox, color="#00BFFF"))
+            self.current_ball_id = support_ball.id
+        else:
+            self.current_ball_id = None
+
+        self.app.set_manual_selected_ids(selected_ids)
+        self.app.set_overlays(overlays)
+        self.app.clear_debug_views()
+
     def _populate_cached_processed_results(self):
         for path in self.burst_remaining_paths:
             resolved = str(Path(path).resolve())
@@ -2982,7 +3102,10 @@ class AICullTool:
                     self._worker_queue.put(("done", idx - 1, True, total))
                     return
                 try:
-                    result = self.evaluate_image_for_pipeline(Path(image_path), config)
+                    def progress_callback(stage_message: str):
+                        self._worker_queue.put(("status", Path(image_path), stage_message, idx, total))
+
+                    result = self.evaluate_image_for_pipeline(Path(image_path), config, progress_callback=progress_callback)
                     self._worker_queue.put(("result", Path(image_path), result, idx, total))
                 except Exception as exc:
                     self._worker_queue.put(("error", Path(image_path), str(exc), idx, total))
@@ -3003,9 +3126,19 @@ class AICullTool:
             if kind == "result":
                 _, image_path, result, idx, total = event
                 self._store_ai_result(Path(image_path), result)
+                if self.auto_mode == "run_current_image":
+                    self._apply_worker_result_to_preview(Path(image_path), result)
                 decision = str(result.get("decision", "Reject"))
                 score = float(result.get("score", 0.0))
                 self.app.log(f"AI Cull {idx}/{total}: {Path(image_path).name} -> {decision} ({score:.1f})")
+            elif kind == "status":
+                _, image_path, stage_message, idx, total = event
+                if self.auto_mode == "run_current_image":
+                    try:
+                        self._set_worker_preview_image(Path(image_path))
+                    except Exception:
+                        pass
+                    self.app.log(f"AI Cull {idx}/{total}: {Path(image_path).name} - {stage_message}")
             elif kind == "error":
                 _, image_path, message, idx, total = event
                 self.app.log(f"AI Cull {idx}/{total}: failed on {Path(image_path).name} ({message})")
