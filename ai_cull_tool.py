@@ -104,6 +104,7 @@ class AICullTool:
     VL_BURST_MAX_TEMPERATURE = 0.2
     VL_BURST_MIN_TOKENS = 256
     VL_BURST_MAX_TOKENS = 450
+    MAX_BURST_THUMBNAILS = 6
 
     def __init__(self, app):
         self.app = app
@@ -863,6 +864,7 @@ class AICullTool:
                         "burst_done",
                         paths, fps, keep_per_burst,
                         summary, burst_groups, removed_paths, remaining_paths,
+                        None, None,
                     ))
             except Exception as exc:
                 self._worker_queue.put(("burst_error", str(exc)))
@@ -2511,7 +2513,7 @@ class AICullTool:
         thumb_w = 240
         thumb_h = 180
         gap = 6
-        n = min(len(group_paths), 6)
+        n = min(len(group_paths), self.MAX_BURST_THUMBNAILS)
         canvas_w = n * thumb_w + (n + 1) * gap
         canvas_h = thumb_h + 2 * gap
         canvas = Image.new("RGB", (canvas_w, canvas_h), (28, 28, 28))
@@ -2814,6 +2816,8 @@ class AICullTool:
         vl_winners: dict[int, list[Path]] = {}
         vl_metas: dict[int, dict] = {}
         removed_paths: set[str] = set()
+        # _select_burst_winners_with_vl guards on config["use_vl_burst_tiebreaker"], so we must
+        # pass this explicitly even though the calling context already established VL usage.
         vl_config = {"use_vl_burst_tiebreaker": True}
 
         for group_idx, group in enumerate(burst_groups, start=1):
@@ -3509,8 +3513,8 @@ class AICullTool:
                 self.burst_eval_details_var.set(msg)
             elif kind == "burst_group_start":
                 _, idx, total, group_paths, preview_image = event
-                names = ", ".join(Path(p).name for p in group_paths[:6])
-                suffix = f" +{len(group_paths) - 6} more" if len(group_paths) > 6 else ""
+                names = ", ".join(Path(p).name for p in group_paths[:self.MAX_BURST_THUMBNAILS])
+                suffix = f" +{len(group_paths) - self.MAX_BURST_THUMBNAILS} more" if len(group_paths) > self.MAX_BURST_THUMBNAILS else ""
                 self.app.log(
                     f"AI Cull Burst: group {idx}/{total} — {len(group_paths)} image(s): {names}{suffix}"
                 )
@@ -3549,9 +3553,7 @@ class AICullTool:
                     except Exception:
                         pass
             elif kind == "burst_done":
-                _, paths, fps, keep_per_burst, summary, burst_groups, removed_paths, remaining_paths, *vl_data = event
-                vl_winners = vl_data[0] if vl_data else None
-                vl_metas = vl_data[1] if len(vl_data) > 1 else None
+                _, paths, fps, keep_per_burst, summary, burst_groups, removed_paths, remaining_paths, vl_winners, vl_metas = event
                 self._persist_burst_evaluation_cache(paths, burst_groups, removed_paths, keep_per_burst, vl_winners=vl_winners, vl_metas=vl_metas)
                 self.precomputed_burst_state = {"folder": str(self.app.state.input_folder.resolve()), "fps": fps, "groups": [[str(p) for p in g] for g in burst_groups]}
                 self.burst_analysis_complete = True
