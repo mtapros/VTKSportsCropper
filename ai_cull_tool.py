@@ -301,7 +301,9 @@ class AICullTool:
             self.input_folder_var.set("Input Folder: —")
         else:
             self.input_folder_var.set(f"Input Folder: {folder}")
-        self.loaded_image_count = len(self.app.state.all_image_paths or self.app.state.image_paths or [])
+        all_paths = getattr(self.app.state, "all_image_paths", None)
+        visible_paths = getattr(self.app.state, "image_paths", None)
+        self.loaded_image_count = len(all_paths or visible_paths or [])
         self.loaded_count_var.set(f"Loaded: {self.loaded_image_count} images")
         self._refresh_accounting_labels()
 
@@ -662,7 +664,7 @@ class AICullTool:
             self.app.log("AI Cull: select an input folder first.")
             return None
         self._sync_folder_and_loaded_state()
-        if not (self.app.state.all_image_paths or self.app.state.image_paths):
+        if not (getattr(self.app.state, "all_image_paths", None) or getattr(self.app.state, "image_paths", None)):
             self.app.start_batch()
             self._sync_folder_and_loaded_state()
         paths = self._folder_batch_source_paths()
@@ -2399,7 +2401,9 @@ class AICullTool:
         self._persist_burst_suppression_results(results)
 
     def _folder_batch_source_paths(self) -> list[Path]:
-        return [Path(p) for p in (self.app.state.all_image_paths or self.app.state.image_paths)]
+        all_paths = getattr(self.app.state, "all_image_paths", None)
+        visible_paths = getattr(self.app.state, "image_paths", None)
+        return [Path(p) for p in (all_paths or visible_paths or [])]
 
     def run_burst_suppression_input_folder(self):
         if self.auto_running:
@@ -2410,7 +2414,7 @@ class AICullTool:
             self.app.log("AI Cull: please select an input folder first.")
             return
 
-        if not (self.app.state.all_image_paths or self.app.state.image_paths):
+        if not (getattr(self.app.state, "all_image_paths", None) or getattr(self.app.state, "image_paths", None)):
             self.app.log("AI Cull: loading images from input folder...")
             self.app.start_batch()
 
@@ -2478,8 +2482,13 @@ class AICullTool:
             self.app.set_overlays([])
             return
 
-        runtime_config = self.get_runtime_config()
         self._log_current_burst_state()
+
+    def _run_current_image_analysis(self):
+        if self.app.current_image is None:
+            return
+
+        runtime_config = self.get_runtime_config()
 
         if str(runtime_config.get("sport_type", "")).lower() == "dance" or bool(runtime_config.get("use_dance_vl", False)):
             profile = self.get_profile_data()
@@ -2760,6 +2769,7 @@ class AICullTool:
 
     def rerun(self):
         self.on_image_changed()
+        self._run_current_image_analysis()
 
     def _decision_bucket_name(self, decision: str, burst_suppressed: bool = False) -> str:
         if burst_suppressed:
@@ -2806,7 +2816,7 @@ class AICullTool:
         self._sync_folder_and_loaded_state()
         self._update_vision_warning()
 
-        if not (self.app.state.all_image_paths or self.app.state.image_paths):
+        if not (getattr(self.app.state, "all_image_paths", None) or getattr(self.app.state, "image_paths", None)):
             self.app.log("AI Cull: loading images from input folder...")
             self.app.start_batch()
             self._sync_folder_and_loaded_state()
