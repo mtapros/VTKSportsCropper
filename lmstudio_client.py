@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import io
 import json
-import re
 from pathlib import Path
 from urllib import error, request
 
@@ -13,6 +12,7 @@ from PIL import Image, ImageOps
 class LMStudioClient:
     SCENE_TYPES = {"intro_pose", "finale_pose", "group_static_pose", "action", "unknown"}
     COMPOSITION_PRESERVE_SCENE_TYPES = {"intro_pose", "finale_pose", "group_static_pose"}
+    MAX_RAW_RESPONSE_EXCERPT = 700
 
     def __init__(self, base_url: str, timeout: float = 60.0):
         self.base_url = base_url.strip().rstrip("/")
@@ -220,8 +220,19 @@ class LMStudioClient:
     def _strip_markdown_code_fences(self, text: str) -> tuple[str, list[str]]:
         raw = text or ""
         stripped = raw.strip()
-        fenced_blocks = re.findall(r"```(?:json)?\s*(.*?)```", stripped, flags=re.IGNORECASE | re.DOTALL)
-        candidates = [block.strip() for block in fenced_blocks if block and block.strip()]
+        fence_parts = stripped.split("```")
+        candidates: list[str] = []
+        for idx in range(1, len(fence_parts), 2):
+            block = fence_parts[idx].strip()
+            if not block:
+                continue
+            if "\n" in block:
+                first_line, rest = block.split("\n", 1)
+                first_line = first_line.strip().lower()
+                if first_line in {"json", "javascript", "js"}:
+                    block = rest.strip()
+            if block:
+                candidates.append(block)
         if candidates:
             return candidates[0], candidates
         return stripped, []
@@ -432,7 +443,7 @@ class LMStudioClient:
         try:
             parsed = self._extract_json_object(text)
         except Exception as exc:
-            raw_excerpt = text.strip().replace("\n", "\\n")[:700]
+            raw_excerpt = text.strip().replace("\n", "\\n")[:self.MAX_RAW_RESPONSE_EXCERPT]
             return {
                 "scene_type": "unknown",
                 "is_group_pose": False,

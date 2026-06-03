@@ -99,6 +99,11 @@ class AICullTool:
     MAX_VL_BURST_CANDIDATES = 6
     VL_BURST_SCORE_TIE_THRESHOLD = 8.0
     VL_BURST_PANEL_LABELS = ("A", "B", "C", "D")
+    VL_BURST_MAX_ROUND_IMAGES = 4
+    VL_BURST_MAX_NEW_CHALLENGERS = 3
+    VL_BURST_MAX_TEMPERATURE = 0.2
+    VL_BURST_MIN_TOKENS = 256
+    VL_BURST_MAX_TOKENS = 450
 
     def __init__(self, app):
         self.app = app
@@ -2480,8 +2485,8 @@ class AICullTool:
     ) -> tuple[Path, dict[str, dict]]:
         if not round_items:
             raise ValueError("No burst round items")
-        if len(round_items) > 4:
-            raise ValueError("Burst round supports at most 4 items")
+        if len(round_items) > self.VL_BURST_MAX_ROUND_IMAGES:
+            raise ValueError(f"Burst round supports at most {self.VL_BURST_MAX_ROUND_IMAGES} items")
 
         panel_w = 560
         panel_h = 480
@@ -2587,8 +2592,8 @@ class AICullTool:
             image_path=grid_path,
             user_prompt=user_prompt,
             system_prompt=system_prompt,
-            temperature=min(max(0.0, temperature), 0.2),
-            max_tokens=max(256, min(max_tokens, 450)),
+            temperature=min(max(0.0, temperature), self.VL_BURST_MAX_TEMPERATURE),
+            max_tokens=max(self.VL_BURST_MIN_TOKENS, min(max_tokens, self.VL_BURST_MAX_TOKENS)),
         )
         parsed = client._extract_json_object(raw_text)
 
@@ -2636,7 +2641,7 @@ class AICullTool:
         round_index = start_round
         round_meta: list[dict] = []
         cursor = 0
-        chunk = items[: min(4, len(items))]
+        chunk = items[: min(self.VL_BURST_MAX_ROUND_IMAGES, len(items))]
 
         winner, meta = self._run_burst_vl_round(
             client=client,
@@ -2651,7 +2656,7 @@ class AICullTool:
         round_index += 1
 
         while cursor < len(items):
-            opponents = items[cursor: cursor + 3]
+            opponents = items[cursor:cursor + self.VL_BURST_MAX_NEW_CHALLENGERS]
             if not opponents:
                 break
             winner, meta = self._run_burst_vl_round(
