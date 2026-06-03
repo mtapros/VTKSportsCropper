@@ -508,7 +508,7 @@ class AICullTool:
             "enable_burst": bool(self.enable_burst_var.get()),
             "burst_fps": float(self.burst_fps_var.get().strip() or "8"),
             "keep_per_burst": int(self.keep_per_burst_var.get().strip() or "1"),
-            "use_vl_burst_tiebreaker": True,
+            "use_vl_burst_tiebreaker": bool(self.use_vl_burst_tiebreaker_var.get()),
             "prefer_face": bool(self.prefer_face_var.get()),
             "sport_type": getattr(profile, "sport_type", "generic"),
             "use_object_cull": bool(self.use_object_cull_var.get()),
