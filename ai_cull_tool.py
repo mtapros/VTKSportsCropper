@@ -8,7 +8,7 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
 from PIL import Image, ImageOps, ExifTags, ImageDraw, ImageFont
 
@@ -82,7 +82,7 @@ class DanceCullCache:
 class AICullTool:
     tool_id = "ai_cull"
     display_name = "AI Cull Tool"
-    BURST_EVAL_WINDOW_GEOMETRY = "480x240"
+    BURST_EVAL_WINDOW_GEOMETRY = "520x420"
 
     DANCE_PICK_COLORS = [
         ("red", "#FF4D4D"),
@@ -141,13 +141,29 @@ class AICullTool:
         self.auto_index = 0
         self.auto_mode = "auto_cull"
         self.auto_button = None
+        self.select_folder_button = None
         self.burst_button = None
         self.evaluate_bursts_button = None
+        self.object_settings_button = None
+        self.vision_settings_button = None
         self.crop_keep_button = None
         self.lmstudio_settings_button = None
         self.stop_button = None
         self.burst_eval_window = None
+        self.object_settings_window = None
+        self.vision_settings_window = None
         self.burst_eval_details_var = tk.StringVar(value="Burst preflight not run.")
+        self.input_folder_var = tk.StringVar(value="Input Folder: —")
+        self.loaded_count_var = tk.StringVar(value="Loaded: 0 images")
+        self.burst_accounting_var = tk.StringVar(value="Removed by bursts: —\nRemaining after burst filter: —")
+        self.cull_accounting_var = tk.StringVar(value="Keep: —\nMaybe: —\nReject: —\nReject-Bursts: —")
+        self.reconciliation_var = tk.StringVar(value="Input total: 0\nOutput total: 0 + 0 + 0 + 0 = 0")
+        self.vision_warning_var = tk.StringVar(value="")
+        self.loaded_image_count = 0
+        self.accounting_folder_key: str | None = None
+        self.removed_by_bursts_count: int | None = None
+        self.remaining_after_burst_count: int | None = None
+        self.last_run_counts = {"Keep": None, "Maybe": None, "Reject": None, "Reject-Bursts": None}
         self.precomputed_burst_state: dict | None = None
         self.auto_all_images: list[Path] = []
         self.auto_precomputed_bursts: list[list[Path]] = []
@@ -160,170 +176,60 @@ class AICullTool:
 
         tk.Label(
             self.panel,
-            text="AI Cull Settings",
+            text="AI Cull Workflow",
             bg="#2a2a2a",
             fg="white",
             font=("Arial", 11, "bold"),
         ).pack(anchor="w", **pad)
 
-        tk.Label(self.panel, text="Detection Mode", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
-        ttk.Combobox(
-            self.panel,
-            textvariable=self.detection_mode_var,
-            values=["Hybrid", "Phrase Only"],
-            state="readonly",
-        ).pack(fill="x", **pad)
-
+        folder_row = tk.Frame(self.panel, bg="#2a2a2a")
+        folder_row.pack(fill="x", padx=10, pady=(6, 4))
+        self.select_folder_button = tk.Button(folder_row, text="Select Folder", command=self.select_input_folder)
+        self.select_folder_button.pack(side="left")
+        tk.Label(folder_row, textvariable=self.loaded_count_var, bg="#2a2a2a", fg="#c9d7ff").pack(side="left", padx=(10, 0))
         tk.Label(
             self.panel,
-            text="Prompts",
+            textvariable=self.input_folder_var,
             bg="#2a2a2a",
-            fg="white",
-            font=("Arial", 10, "bold"),
-        ).pack(anchor="w", pady=(10, 4), padx=10)
-
-        for i, var in enumerate(self.prompt_vars, start=1):
-            tk.Label(self.panel, text=f"Prompt {i}", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
-            tk.Entry(self.panel, textvariable=var).pack(fill="x", **pad)
-
-        tk.Label(self.panel, text="Keep Threshold", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
-        tk.Entry(self.panel, textvariable=self.keep_threshold_var).pack(fill="x", **pad)
-
-        tk.Label(self.panel, text="Maybe Threshold", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
-        tk.Entry(self.panel, textvariable=self.maybe_threshold_var).pack(fill="x", **pad)
-
-        tk.Label(self.panel, text="Blur Penalty Threshold", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
-        tk.Entry(self.panel, textvariable=self.blur_penalty_threshold_var).pack(fill="x", **pad)
-
-        tk.Label(self.panel, text="Blur Reject Threshold", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
-        tk.Entry(self.panel, textvariable=self.blur_reject_threshold_var).pack(fill="x", **pad)
-
-        tk.Label(self.panel, text="Blur Penalty Points", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
-        tk.Entry(self.panel, textvariable=self.blur_penalty_points_var).pack(fill="x", **pad)
-
-        tk.Label(
-            self.panel,
-            text="Burst Suppression",
-            bg="#2a2a2a",
-            fg="white",
-            font=("Arial", 10, "bold"),
-        ).pack(anchor="w", pady=(12, 4), padx=10)
-
-        tk.Checkbutton(
-            self.panel,
-            text="Enable Burst Suppression",
-            variable=self.enable_burst_var,
-            bg="#2a2a2a",
-            fg="white",
-            selectcolor="#444",
-        ).pack(anchor="w", **pad)
-
-        tk.Label(self.panel, text="Burst FPS Threshold", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
-        tk.Entry(self.panel, textvariable=self.burst_fps_var).pack(fill="x", **pad)
-
-        tk.Label(self.panel, text="Keep Per Burst", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
-        tk.Entry(self.panel, textvariable=self.keep_per_burst_var).pack(fill="x", **pad)
-
-        tk.Checkbutton(
-            self.panel,
-            text="Use VL Burst Tie-Breaker",
-            variable=self.use_vl_burst_tiebreaker_var,
-            bg="#2a2a2a",
-            fg="white",
-            selectcolor="#444",
-        ).pack(anchor="w", **pad)
-
-        tk.Checkbutton(
-            self.panel,
-            text="Hide Burst-Suppressed Images",
-            variable=self.hide_burst_suppressed_var,
-            command=self.refresh_burst_browser_view,
-            bg="#2a2a2a",
-            fg="white",
-            selectcolor="#444",
-        ).pack(anchor="w", **pad)
-
-        tk.Checkbutton(
-            self.panel,
-            text="Prefer Visible Face",
-            variable=self.prefer_face_var,
-            bg="#2a2a2a",
-            fg="white",
-            selectcolor="#444",
-        ).pack(anchor="w", **pad)
-
-        self.dance_frame = tk.Frame(self.panel, bg="#2a2a2a")
-        self.dance_frame.pack(fill="x", padx=10, pady=(12, 4))
-
-        tk.Label(
-            self.dance_frame,
-            text="Vision Model Culling",
-            bg="#2a2a2a",
-            fg="#ffd27f",
-            font=("Arial", 10, "bold"),
-        ).pack(anchor="w", pady=(0, 4))
-
-        tk.Checkbutton(
-            self.dance_frame,
-            text="Use LM Studio VL Rubric",
-            variable=self.use_dance_vl_var,
-            bg="#2a2a2a",
-            fg="white",
-            selectcolor="#444",
-        ).pack(anchor="w")
-
-        tk.Checkbutton(
-            self.dance_frame,
-            text="Use VL Subject Picker",
-            variable=self.use_dance_vl_subject_picker_var,
-            bg="#2a2a2a",
-            fg="white",
-            selectcolor="#444",
-        ).pack(anchor="w")
-
-        tk.Checkbutton(
-            self.dance_frame,
-            text="Classify Intro/Finale/Group Poses",
-            variable=self.use_dance_scene_classifier_var,
-            bg="#2a2a2a",
-            fg="white",
-            selectcolor="#444",
-        ).pack(anchor="w")
-
-        tk.Checkbutton(
-            self.dance_frame,
-            text="Save VL Debug Images",
-            variable=self.save_vl_debug_images_var,
-            bg="#2a2a2a",
-            fg="white",
-            selectcolor="#444",
-        ).pack(anchor="w")
-
-        tk.Checkbutton(
-            self.dance_frame,
-            text="Show 4-Panel Debug Preview",
-            variable=self.show_dance_debug_preview_var,
-            bg="#2a2a2a",
-            fg="white",
-            selectcolor="#444",
-        ).pack(anchor="w")
-
-        tk.Button(self.panel, text="Rerun AI Cull", command=self.rerun).pack(fill="x", padx=10, pady=(10, 4))
-        tk.Button(self.panel, text="Approve Keep/Maybe", command=self.approve).pack(fill="x", padx=10, pady=(0, 4))
-
-        self.burst_button = tk.Button(
-            self.panel,
-            text="Run Burst Suppression",
-            command=self.run_burst_suppression_input_folder,
-        )
-        self.burst_button.pack(fill="x", padx=10, pady=(0, 4))
+            fg="#d9d9d9",
+            justify="left",
+            wraplength=320,
+        ).pack(anchor="w", padx=10, pady=(0, 8))
 
         self.evaluate_bursts_button = tk.Button(
             self.panel,
             text="Evaluate Bursts",
             command=self.open_burst_evaluation_window,
         )
-        self.evaluate_bursts_button.pack(fill="x", padx=10, pady=(0, 4))
+        self.evaluate_bursts_button.pack(fill="x", padx=10, pady=(0, 6))
+
+        self.object_settings_button = tk.Button(
+            self.panel,
+            text="Cull by Object",
+            command=self.open_object_settings_window,
+        )
+        self.object_settings_button.pack(fill="x", padx=10, pady=(0, 6))
+
+        self.vision_settings_button = tk.Button(
+            self.panel,
+            text="Cull by Vision",
+            command=self.open_vision_settings_window,
+        )
+        self.vision_settings_button.pack(fill="x", padx=10, pady=(0, 2))
+
+        tk.Label(
+            self.panel,
+            textvariable=self.vision_warning_var,
+            bg="#2a2a2a",
+            fg="#ffd27f",
+            justify="left",
+            wraplength=320,
+        ).pack(anchor="w", padx=10, pady=(0, 8))
+
+        tk.Button(self.panel, text="Rerun Current Image", command=self.rerun).pack(fill="x", padx=10, pady=(0, 4))
+
+        self.auto_button = tk.Button(self.panel, text="Run All", command=self.auto_cull_input_folder)
+        self.auto_button.pack(fill="x", padx=10, pady=(0, 4))
 
         tk.Label(
             self.panel,
@@ -331,29 +237,36 @@ class AICullTool:
             bg="#2a2a2a",
             fg="#c9d7ff",
             justify="left",
-            wraplength=300,
+            wraplength=320,
+        ).pack(anchor="w", padx=10, pady=(4, 6))
+        tk.Label(
+            self.panel,
+            textvariable=self.burst_accounting_var,
+            bg="#2a2a2a",
+            fg="#d3e3ff",
+            justify="left",
+            wraplength=320,
         ).pack(anchor="w", padx=10, pady=(0, 6))
-
-        self.auto_button = tk.Button(self.panel, text="Auto Cull Input Folder", command=self.auto_cull_input_folder)
-        self.auto_button.pack(fill="x", padx=10, pady=(0, 4))
-
-        self.crop_keep_button = tk.Button(
+        tk.Label(
             self.panel,
-            text="Crop Output/Keep",
-            command=self.open_keep_bucket_for_cropping,
-        )
-        self.crop_keep_button.pack(fill="x", padx=10, pady=(0, 4))
-
-        self.lmstudio_settings_button = tk.Button(
+            textvariable=self.cull_accounting_var,
+            bg="#2a2a2a",
+            fg="#d3e3ff",
+            justify="left",
+            wraplength=320,
+        ).pack(anchor="w", padx=10, pady=(0, 4))
+        tk.Label(
             self.panel,
-            text="LM Studio Settings…",
-            command=self.open_lmstudio_settings_window,
-        )
-        self.lmstudio_settings_button.pack(fill="x", padx=10, pady=(0, 4))
+            textvariable=self.reconciliation_var,
+            bg="#2a2a2a",
+            fg="#c6ffc6",
+            justify="left",
+            wraplength=320,
+        ).pack(anchor="w", padx=10, pady=(0, 8))
 
         self.stop_button = tk.Button(
             self.panel,
-            text="Stop Current Operation",
+            text="Stop",
             command=self.stop_auto_cull,
             state="disabled",
             bg="#8b1e1e",
@@ -361,6 +274,9 @@ class AICullTool:
         )
         self.stop_button.pack(fill="x", padx=10, pady=(0, 4))
 
+        self._sync_folder_and_loaded_state()
+        self._update_vision_warning()
+        self._refresh_accounting_labels()
         self._refresh_dynamic_sections()
         return self.panel
 
@@ -371,11 +287,79 @@ class AICullTool:
             return True
         return "dance" in profile.name.lower()
 
-    def _refresh_dynamic_sections(self):
-        if self.dance_frame is None:
+    def _sync_folder_and_loaded_state(self):
+        folder = self.app.state.input_folder
+        folder_key = str(folder.resolve()) if folder is not None else None
+        if folder_key != self.accounting_folder_key:
+            self.accounting_folder_key = folder_key
+            self.precomputed_burst_state = None
+            self.burst_eval_details_var.set("Burst preflight not run.")
+            self.removed_by_bursts_count = None
+            self.remaining_after_burst_count = None
+            self.last_run_counts = {"Keep": None, "Maybe": None, "Reject": None, "Reject-Bursts": None}
+        if folder is None:
+            self.input_folder_var.set("Input Folder: —")
+        else:
+            self.input_folder_var.set(f"Input Folder: {folder}")
+        self.loaded_image_count = len(self.app.state.all_image_paths or self.app.state.image_paths or [])
+        self.loaded_count_var.set(f"Loaded: {self.loaded_image_count} images")
+        self._refresh_accounting_labels()
+
+    def _update_vision_warning(self):
+        tool = self.app.tools_by_id.get("lmstudio")
+        model = ""
+        if tool is not None and hasattr(tool, "model_var"):
+            try:
+                model = str(tool.model_var.get() or "").strip()
+            except Exception:
+                model = ""
+        if model:
+            self.vision_warning_var.set("")
+        else:
+            self.vision_warning_var.set("No model loaded — cull will run by object only")
+
+    def _refresh_accounting_labels(self):
+        removed = "—" if self.removed_by_bursts_count is None else str(self.removed_by_bursts_count)
+        remaining = "—" if self.remaining_after_burst_count is None else str(self.remaining_after_burst_count)
+        self.burst_accounting_var.set(
+            f"Removed by bursts: {removed}\nRemaining after burst filter: {remaining}"
+        )
+
+        keep = self.last_run_counts.get("Keep")
+        maybe = self.last_run_counts.get("Maybe")
+        reject = self.last_run_counts.get("Reject")
+        reject_bursts = self.last_run_counts.get("Reject-Bursts")
+
+        fmt = lambda value: "—" if value is None else str(value)
+        self.cull_accounting_var.set(
+            f"Keep: {fmt(keep)}\nMaybe: {fmt(maybe)}\nReject: {fmt(reject)}\nReject-Bursts: {fmt(reject_bursts)}"
+        )
+
+        keep_val = int(keep or 0)
+        maybe_val = int(maybe or 0)
+        reject_val = int(reject or 0)
+        reject_bursts_val = int(reject_bursts or 0)
+        output_total = keep_val + maybe_val + reject_val + reject_bursts_val
+        self.reconciliation_var.set(
+            f"Input total: {self.loaded_image_count}\n"
+            f"Output total: {keep_val} + {maybe_val} + {reject_val} + {reject_bursts_val} = {output_total}"
+        )
+
+    def _reset_accounting_for_new_folder(self):
+        self.accounting_folder_key = None
+        self._sync_folder_and_loaded_state()
+
+    def select_input_folder(self):
+        folder = filedialog.askdirectory()
+        if not folder:
             return
-        if not self.dance_frame.winfo_ismapped():
-            self.dance_frame.pack(fill="x", padx=10, pady=(12, 4))
+        self.app.set_input_folder(folder)
+        self._reset_accounting_for_new_folder()
+        self._sync_folder_and_loaded_state()
+        self._update_vision_warning()
+
+    def _refresh_dynamic_sections(self):
+        return
 
     def apply_profile(self, profile: SportProfile):
         prompts = list(profile.prompts[:4])
@@ -446,6 +430,124 @@ class AICullTool:
             return
         tool.open_settings_window()
 
+    def open_object_settings_window(self):
+        if self.object_settings_window is not None and self.object_settings_window.winfo_exists():
+            self.object_settings_window.deiconify()
+            self.object_settings_window.lift()
+            self.object_settings_window.focus_force()
+            return
+
+        win = tk.Toplevel(self.app.root)
+        win.title("Cull by Object")
+        win.geometry("480x620")
+        win.configure(bg="#2a2a2a")
+        self.object_settings_window = win
+        win.protocol("WM_DELETE_WINDOW", lambda: (setattr(self, "object_settings_window", None), win.destroy()))
+
+        pad = {"padx": 10, "pady": 4}
+        tk.Label(win, text="Object Culling Settings", bg="#2a2a2a", fg="white", font=("Arial", 11, "bold")).pack(anchor="w", **pad)
+        tk.Label(win, text="Detection Mode", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+        ttk.Combobox(
+            win,
+            textvariable=self.detection_mode_var,
+            values=["Hybrid", "Phrase Only"],
+            state="readonly",
+        ).pack(fill="x", **pad)
+
+        tk.Label(win, text="Prompts", bg="#2a2a2a", fg="white", font=("Arial", 10, "bold")).pack(anchor="w", pady=(10, 4), padx=10)
+        for i, var in enumerate(self.prompt_vars, start=1):
+            tk.Label(win, text=f"Prompt {i}", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+            tk.Entry(win, textvariable=var).pack(fill="x", **pad)
+
+        tk.Label(win, text="Keep Threshold", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+        tk.Entry(win, textvariable=self.keep_threshold_var).pack(fill="x", **pad)
+        tk.Label(win, text="Maybe Threshold", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+        tk.Entry(win, textvariable=self.maybe_threshold_var).pack(fill="x", **pad)
+        tk.Label(win, text="Blur Penalty Threshold", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+        tk.Entry(win, textvariable=self.blur_penalty_threshold_var).pack(fill="x", **pad)
+        tk.Label(win, text="Blur Reject Threshold", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+        tk.Entry(win, textvariable=self.blur_reject_threshold_var).pack(fill="x", **pad)
+        tk.Label(win, text="Blur Penalty Points", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+        tk.Entry(win, textvariable=self.blur_penalty_points_var).pack(fill="x", **pad)
+        tk.Checkbutton(
+            win,
+            text="Prefer Visible Face",
+            variable=self.prefer_face_var,
+            bg="#2a2a2a",
+            fg="white",
+            selectcolor="#444",
+        ).pack(anchor="w", **pad)
+        tk.Button(win, text="Close", command=win.destroy).pack(fill="x", padx=10, pady=(8, 8))
+
+    def open_vision_settings_window(self):
+        if self.vision_settings_window is not None and self.vision_settings_window.winfo_exists():
+            self.vision_settings_window.deiconify()
+            self.vision_settings_window.lift()
+            self.vision_settings_window.focus_force()
+            return
+
+        win = tk.Toplevel(self.app.root)
+        win.title("Cull by Vision")
+        win.geometry("480x360")
+        win.configure(bg="#2a2a2a")
+        self.vision_settings_window = win
+        win.protocol("WM_DELETE_WINDOW", lambda: (setattr(self, "vision_settings_window", None), win.destroy()))
+
+        pad = {"padx": 10, "pady": 4}
+        tk.Label(win, text="Vision Culling Settings", bg="#2a2a2a", fg="white", font=("Arial", 11, "bold")).pack(anchor="w", **pad)
+        tk.Checkbutton(
+            win,
+            text="Use LM Studio Vision Rubric",
+            variable=self.use_dance_vl_var,
+            bg="#2a2a2a",
+            fg="white",
+            selectcolor="#444",
+        ).pack(anchor="w", **pad)
+        tk.Checkbutton(
+            win,
+            text="Use Vision Subject Picker",
+            variable=self.use_dance_vl_subject_picker_var,
+            bg="#2a2a2a",
+            fg="white",
+            selectcolor="#444",
+        ).pack(anchor="w", **pad)
+        tk.Checkbutton(
+            win,
+            text="Classify Intro/Finale/Group Poses",
+            variable=self.use_dance_scene_classifier_var,
+            bg="#2a2a2a",
+            fg="white",
+            selectcolor="#444",
+        ).pack(anchor="w", **pad)
+        tk.Checkbutton(
+            win,
+            text="Save Vision Debug Images",
+            variable=self.save_vl_debug_images_var,
+            bg="#2a2a2a",
+            fg="white",
+            selectcolor="#444",
+        ).pack(anchor="w", **pad)
+        tk.Checkbutton(
+            win,
+            text="Show 4-Panel Debug Preview",
+            variable=self.show_dance_debug_preview_var,
+            bg="#2a2a2a",
+            fg="white",
+            selectcolor="#444",
+        ).pack(anchor="w", **pad)
+        tk.Button(win, text="LM Studio Settings…", command=self.open_lmstudio_settings_window).pack(fill="x", padx=10, pady=(8, 4))
+        self._update_vision_warning()
+        if self.vision_warning_var.get().strip():
+            tk.Label(
+                win,
+                textvariable=self.vision_warning_var,
+                bg="#2a2a2a",
+                fg="#ffd27f",
+                justify="left",
+                wraplength=440,
+            ).pack(anchor="w", padx=10, pady=(0, 6))
+        tk.Button(win, text="Close", command=win.destroy).pack(fill="x", padx=10, pady=(6, 8))
+
     def open_keep_bucket_for_cropping(self):
         if self.app.state.input_folder is None:
             self.app.log("AI Cull: select an input folder first.")
@@ -480,6 +582,9 @@ class AICullTool:
         fps = float(runtime.get("burst_fps", 8.0))
         groups = self._build_bursts([Path(p) for p in ordered_paths], fps)
         summary = self._summarize_burst_groups(groups, len(ordered_paths))
+        keep_per_burst = max(1, int(runtime.get("keep_per_burst", 1)))
+        removed_by_bursts = sum(max(0, len(group) - keep_per_burst) for group in groups if len(group) > 1)
+        remaining_after_burst = max(0, len(ordered_paths) - removed_by_bursts)
         folder = source_folder or self.app.state.input_folder
         if folder is not None:
             self.precomputed_burst_state = {
@@ -490,12 +595,21 @@ class AICullTool:
             if config is not None:
                 config["precomputed_burst_groups"] = list(self.precomputed_burst_state["groups"])
                 config["precomputed_burst_fps"] = fps
+        self.removed_by_bursts_count = removed_by_bursts
+        self.remaining_after_burst_count = remaining_after_burst
+        self._refresh_accounting_labels()
         self.burst_eval_details_var.set(
-            f"Burst preflight @ {fps:.2f} FPS: groups={summary['group_count']}, "
-            f"burst-images={summary['burst_images']}, singles={summary['singleton_images']}, "
-            f"largest={summary['largest_group']}"
+            f"Burst evaluation @ {fps:.2f} FPS: groups={summary['group_count']}, "
+            f"burst-images={summary['burst_images']}, removed-by-bursts={removed_by_bursts}, "
+            f"remaining-after-filter={remaining_after_burst}, largest={summary['largest_group']}"
         )
-        return {"fps": fps, "groups": groups, **summary}
+        return {
+            "fps": fps,
+            "groups": groups,
+            "removed_by_bursts": removed_by_bursts,
+            "remaining_after_burst": remaining_after_burst,
+            **summary,
+        }
 
     def _resolve_burst_groups(self, ordered_paths: list[Path], config: dict) -> list[list[Path]]:
         resolved_paths = [Path(p) for p in ordered_paths]
@@ -547,8 +661,10 @@ class AICullTool:
         if self.app.state.input_folder is None:
             self.app.log("AI Cull: select an input folder first.")
             return None
+        self._sync_folder_and_loaded_state()
         if not (self.app.state.all_image_paths or self.app.state.image_paths):
             self.app.start_batch()
+            self._sync_folder_and_loaded_state()
         paths = self._folder_batch_source_paths()
         if not paths:
             self.app.log("AI Cull: no images found in input folder.")
@@ -556,7 +672,8 @@ class AICullTool:
         summary = self.prepare_burst_groups_for_paths(paths)
         self.app.log(
             f"AI Cull Burst Evaluate: groups={summary['group_count']} "
-            f"burst-images={summary['burst_images']} total={len(paths)} fps={summary['fps']:.2f}"
+            f"burst-images={summary['burst_images']} removed={summary['removed_by_bursts']} "
+            f"remaining={summary['remaining_after_burst']} total={len(paths)} fps={summary['fps']:.2f}"
         )
         return summary
 
@@ -581,8 +698,35 @@ class AICullTool:
             fg="white",
             font=("Arial", 11, "bold"),
         ).pack(anchor="w", **pad)
+        tk.Checkbutton(
+            win,
+            text="Enable Burst Suppression",
+            variable=self.enable_burst_var,
+            bg="#2a2a2a",
+            fg="white",
+            selectcolor="#444",
+        ).pack(anchor="w", **pad)
         tk.Label(win, text="Burst FPS Threshold", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
         tk.Entry(win, textvariable=self.burst_fps_var).pack(fill="x", **pad)
+        tk.Label(win, text="Keep Per Burst", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+        tk.Entry(win, textvariable=self.keep_per_burst_var).pack(fill="x", **pad)
+        tk.Checkbutton(
+            win,
+            text="Use VL Burst Tie-Breaker",
+            variable=self.use_vl_burst_tiebreaker_var,
+            bg="#2a2a2a",
+            fg="white",
+            selectcolor="#444",
+        ).pack(anchor="w", **pad)
+        tk.Checkbutton(
+            win,
+            text="Hide Burst-Suppressed Images",
+            variable=self.hide_burst_suppressed_var,
+            command=self.refresh_burst_browser_view,
+            bg="#2a2a2a",
+            fg="white",
+            selectcolor="#444",
+        ).pack(anchor="w", **pad)
         tk.Button(win, text="Run Burst Scan", command=self._run_burst_preflight_scan).pack(fill="x", padx=10, pady=(8, 6))
         tk.Label(
             win,
@@ -2312,6 +2456,8 @@ class AICullTool:
         self.app.root.after(10, self._auto_cull_step)
 
     def on_image_changed(self):
+        self._sync_folder_and_loaded_state()
+        self._update_vision_warning()
         self.current_score = 0.0
         self.current_decision = "Reject"
         self.current_hero_id = None
@@ -2436,7 +2582,7 @@ class AICullTool:
                     vl_input_preview = self.current_vl_debug_image_path
 
                 self.app.set_debug_views([
-                    ("Florence Candidates", florence_preview),
+                    ("Object Candidates", florence_preview),
                     ("VL Input", vl_input_preview),
                     ("Final Subject", final_preview),
                     ("Original", original_preview),
@@ -2633,7 +2779,7 @@ class AICullTool:
 
     def _copy_image_to_decision_folder(self, source: Path, decision: str, score: float, burst_suppressed: bool = False):
         bucket = self._decision_bucket_name(decision, burst_suppressed=burst_suppressed)
-        output_dir = self._get_cull_output_dir(bucket)
+        output_dir = self._get_cull_output_dir(decision, burst_suppressed=burst_suppressed)
         if output_dir is None:
             self.app.log("AI Cull: no input folder selected.")
             return
@@ -2657,14 +2803,21 @@ class AICullTool:
             self.app.log("AI Cull: please select an input folder first.")
             return
 
-        if not self.app.state.image_paths:
+        self._sync_folder_and_loaded_state()
+        self._update_vision_warning()
+
+        if not (self.app.state.all_image_paths or self.app.state.image_paths):
             self.app.log("AI Cull: loading images from input folder...")
             self.app.start_batch()
+            self._sync_folder_and_loaded_state()
 
-        self.auto_images = [Path(p) for p in self.app.state.image_paths]
+        self.auto_images = self._folder_batch_source_paths()
         if not self.auto_images:
             self.app.log("AI Cull: no images found in input folder.")
             return
+
+        self.last_run_counts = {"Keep": 0, "Maybe": 0, "Reject": 0, "Reject-Bursts": 0}
+        self._refresh_accounting_labels()
 
         self.auto_results = []
         self.auto_index = 0
@@ -2674,16 +2827,12 @@ class AICullTool:
 
         if self.auto_button is not None:
             self.auto_button.config(state="disabled")
-        if self.burst_button is not None:
-            self.burst_button.config(state="disabled")
         if self.stop_button is not None:
             self.stop_button.config(state="normal")
 
-        total_folder_images = len(self._folder_batch_source_paths())
         self.app.log(
-            f"AI Cull: starting auto cull on {len(self.auto_images)} image(s) "
-            f"(current browser set; folder total={total_folder_images}. "
-            "Run Burst Suppression first to reduce duplicates up front.)"
+            f"AI Cull: starting Run All on {len(self.auto_images)} image(s). "
+            "Burst filtering will use the current burst evaluation settings."
         )
         self.app.root.after(10, self._auto_cull_step)
 
@@ -2722,8 +2871,30 @@ class AICullTool:
             keep_count = sum(1 for r in self.auto_results if r.get("decision") == "Keep")
             maybe_count = sum(1 for r in self.auto_results if r.get("decision") == "Maybe")
             reject_count = sum(1 for r in self.auto_results if r.get("decision") == "Reject")
+            config = self.get_runtime_config()
+            final_results = self.apply_burst_suppression_for_pipeline(self.auto_results, config)
+            self._persist_burst_suppression_results(final_results)
+            all_paths = {Path(item["path"]) for item in final_results}
+            self._persist_non_burst_defaults(list(all_paths), all_paths)
+
+            run_counts = {"Keep": 0, "Maybe": 0, "Reject": 0, "Reject-Bursts": 0}
+            for item in final_results:
+                path = Path(item["path"])
+                decision = str(item.get("decision", "Reject"))
+                score = float(item.get("score", 0.0))
+                burst_suppressed = bool(item.get("burst_suppressed", False))
+                bucket = self._decision_bucket_name(decision, burst_suppressed=burst_suppressed)
+                run_counts[bucket] += 1
+                self._copy_image_to_decision_folder(path, decision, score, burst_suppressed=burst_suppressed)
+
+            self.last_run_counts = run_counts
+            self._refresh_accounting_labels()
+            self.app.refresh_image_browser()
             self.app.log(
-                f"AI Cull: complete. Keep={keep_count}, Maybe={maybe_count}, Reject={reject_count}"
+                f"AI Cull: complete. Keep={run_counts['Keep']}, Maybe={run_counts['Maybe']}, "
+                f"Reject={run_counts['Reject']}, Reject-Bursts={run_counts['Reject-Bursts']} "
+                f"(pre-burst: Keep={keep_count}, Maybe={maybe_count}, Reject={reject_count}). "
+                f"Reconciled={sum(run_counts.values())}/{self.loaded_image_count}"
             )
             self._finish_auto_cull(cancelled=False)
             return
@@ -2748,12 +2919,9 @@ class AICullTool:
                 if decision not in ("Keep", "Maybe", "Reject"):
                     decision = "Reject"
                 score = float(result.get("score", 0.0))
-
-                self._copy_image_to_decision_folder(Path(image_path), decision, score)
-
                 self.app.log(
-                    f"AI Cull Auto {self.auto_index + 1}/{len(self.auto_images)}: "
-                    f"{image_path.name} -> {decision} score={score:.1f}"
+                    f"AI Cull Run All {self.auto_index + 1}/{len(self.auto_images)}: "
+                    f"{image_path.name} analyzed -> {decision} score={score:.1f}"
                 )
         except Exception as exc:
             self.app.log(f"AI Cull: failed on {image_path.name}: {exc}")
@@ -2770,8 +2938,6 @@ class AICullTool:
 
         if self.auto_button is not None:
             self.auto_button.config(state="normal")
-        if self.burst_button is not None:
-            self.burst_button.config(state="normal")
         if self.stop_button is not None:
             self.stop_button.config(state="disabled")
 
