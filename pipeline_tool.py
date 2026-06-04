@@ -279,6 +279,7 @@ class PipelineTool:
         self.crop_config = ai_crop.get_runtime_config()
         self.cached_cull_entries = self._load_cached_cull_entries_by_filename(source_folder)
         self.crop_config["cached_cull_entries"] = self.cached_cull_entries
+        self.crop_config["use_dance_scene_classifier"] = self.cull_config.get("use_dance_scene_classifier", False)
 
         self.output_root = source_folder / "Output"
         self.keep_dir = self.output_root / "Keep"

@@ -629,7 +629,7 @@ class AICullTool:
         ).pack(anchor="w", **pad)
         tk.Checkbutton(
             win,
-            text="Classify Intro/Finale/Group Poses",
+            text="Use Scene Classification (full-frame for intro/finale/group poses)",
             variable=self.use_dance_scene_classifier_var,
             bg="#2a2a2a",
             fg="white",
@@ -841,6 +841,7 @@ class AICullTool:
             runtime["cached_cull_entries"] = self._load_cached_cull_entries_by_filename(Path(cache_folder))
         else:
             runtime["cached_cull_entries"] = {}
+        runtime["use_dance_scene_classifier"] = bool(self.use_dance_scene_classifier_var.get())
 
         output_dir = self._get_ai_cull_crop_output_dir()
         if output_dir is None:
