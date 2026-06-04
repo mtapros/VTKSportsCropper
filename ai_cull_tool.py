@@ -831,6 +831,10 @@ class AICullTool:
         ai_crop = self._get_ai_crop_tool()
         if ai_crop is None:
             return
+        cached_crop = self.app.tools_by_id.get("cached_crop")
+        if cached_crop is None:
+            self.app.log("AI Cull Crop: Cached Crop tool is unavailable.")
+            return
         if not target_paths:
             self.app.log(f"AI Cull Crop: no images available to crop ({label}).")
             return
@@ -848,37 +852,15 @@ class AICullTool:
             self.app.log("AI Cull Crop: no input folder selected. Please select an input folder before cropping.")
             return
 
-        saved = 0
-        total = len(target_paths)
-        self.app.log(f"AI Cull Crop: cropping {total} image(s) ({label})...")
-        for idx, image_path in enumerate(target_paths, start=1):
-            try:
-                self.app.log(f"AI Cull Crop {idx}/{total}: preparing {Path(image_path).name}...")
-                result = ai_crop.evaluate_image_for_pipeline(Path(image_path), runtime)
-                crop_box = result.get("crop")
-                if crop_box is None:
-                    reason = str(result.get("hero_reason", "unknown reason"))
-                    self.app.log(f"AI Cull Crop {idx}/{total}: {Path(image_path).name} -> no crop generated ({reason}).")
-                    continue
-                self._show_ai_cull_crop_preview(Path(image_path), crop_box)
-                resolved_image_path = Path(image_path).resolve()
-                current_image_matches = (
-                    self.app.current_image is not None
-                    and self.app.state.current_image_path is not None
-                    and Path(self.app.state.current_image_path).resolve() == resolved_image_path
-                )
-                if current_image_matches:
-                    image = self.app.current_image.copy()
-                else:
-                    image = self.app.image_repo.load_image(Path(image_path))
-                out_path = output_dir / Path(image_path).name
-                self.app.image_repo.save_crop(image, crop_box, out_path)
-                saved += 1
-                self.app.log(f"AI Cull Crop {idx}/{total}: {Path(image_path).name} -> {out_path.name}")
-            except Exception as exc:
-                self.app.log(f"AI Cull Crop {idx}/{total}: failed on {Path(image_path).name} ({exc})")
-
-        self.app.log(f"AI Cull Crop: saved {saved}/{total} crop(s) to {output_dir}.")
+        cached_crop.crop_paths_with_cached_process(
+            target_paths=[Path(p) for p in target_paths],
+            cached_cull_entries=runtime.get("cached_cull_entries", {}),
+            crops_dir=output_dir,
+            overwrite=True,
+            ratio_override=str(runtime.get("main_ratio", "4:5")),
+            margin_override=float(runtime.get("margin_buffer", 12.0)),
+            log_prefix=f"AI Cull Crop ({label})",
+        )
 
     def crop_current_image_from_ai_cull(self):
         if self.app.state.current_image_path is None:

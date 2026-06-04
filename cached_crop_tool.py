@@ -377,6 +377,56 @@ class CachedCropTool:
         self.app.image_repo.save_crop(image, crop_box, dst)
         return dst
 
+    def crop_paths_with_cached_process(
+        self,
+        target_paths: list[Path],
+        cached_cull_entries: dict[str, dict],
+        crops_dir: Path,
+        *,
+        overwrite: bool = True,
+        ratio_override: str | None = None,
+        margin_override: float | None = None,
+        log_prefix: str = "Cached Crop",
+    ) -> int:
+        if not target_paths:
+            self.app.log(f"{log_prefix}: no images available to crop.")
+            return 0
+
+        self.cached_cull_entries = dict(cached_cull_entries or {})
+        if ratio_override:
+            self.main_ratio_var.set(str(ratio_override))
+        if margin_override is not None:
+            self.margin_var.set(str(margin_override))
+
+        self.images = [Path(p) for p in target_paths]
+        self.app.state.image_paths = list(self.images)
+        self.app.ui.set_thumbnail_paths(self.images)
+
+        saved_count = 0
+        total = len(self.images)
+        self.app.log(f"{log_prefix}: cropping {total} image(s) with cached process...")
+        for idx, image_path in enumerate(self.images, start=1):
+            self.app.state.current_index = idx - 1
+            self.app.load_current_image()
+
+            crop_box, reason = self._compute_selected_crop(image_path)
+            if crop_box is None:
+                self.app.log(f"{log_prefix} {idx}/{total}: {image_path.name} skipped ({reason})")
+                continue
+
+            self.app.set_overlays(self._build_guides(crop_box))
+            saved = self._save_crop_image(image_path, crop_box, crops_dir, overwrite)
+            saved_count += 1
+            self.app.log(f"{log_prefix} {idx}/{total}: {image_path.name} -> {saved.name} ({reason})")
+            try:
+                self.app.root.update_idletasks()
+                self.app.root.update()
+            except Exception:
+                pass
+
+        self.app.log(f"{log_prefix}: saved {saved_count}/{total} crop(s) to {crops_dir}.")
+        return saved_count
+
     def _write_crop_report(self):
         if self.reports_dir is None:
             return
