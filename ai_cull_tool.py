@@ -164,11 +164,15 @@ class AICullTool:
         self.object_settings_button = None
         self.vision_settings_button = None
         self.crop_keep_button = None
+        self.crop_options_button = None
+        self.crop_current_button = None
+        self.crop_all_button = None
         self.lmstudio_settings_button = None
         self.stop_button = None
         self.burst_eval_window = None
         self.object_settings_window = None
         self.vision_settings_window = None
+        self.crop_settings_window = None
         self.input_folder_var = tk.StringVar(value="Selected folder: —")
         self.loaded_count_var = tk.StringVar(value="Loaded: 0 images")
         self.burst_eval_details_var = tk.StringVar(value="Burst preflight not run.")
@@ -278,6 +282,14 @@ class AICullTool:
 
         self.run_full_button = tk.Button(self.panel, text="Run Full Workflow", command=self.run_full_workflow)
         self.run_full_button.pack(fill="x", padx=10, pady=(0, 6))
+
+        ttk.Separator(self.panel, orient="horizontal").pack(fill="x", padx=10, pady=(6, 8))
+        self.crop_options_button = tk.Button(self.panel, text="Cropping Options", command=self.open_crop_settings_window)
+        self.crop_options_button.pack(fill="x", padx=10, pady=(0, 4))
+        self.crop_current_button = tk.Button(self.panel, text="Crop Current Image", command=self.crop_current_image_from_ai_cull)
+        self.crop_current_button.pack(fill="x", padx=10, pady=(0, 4))
+        self.crop_all_button = tk.Button(self.panel, text="Crop All Images", command=self.crop_all_images_from_ai_cull)
+        self.crop_all_button.pack(fill="x", padx=10, pady=(0, 6))
 
         tk.Label(self.panel, textvariable=self.final_accounting_var, bg="#2a2a2a", fg="#c6ffc6", justify="left", wraplength=320).pack(anchor="w", padx=10, pady=(0, 8))
         self.stop_button = tk.Button(self.panel, text="Stop", command=self.stop_auto_cull, state="disabled", bg="#8b1e1e", fg="white")
@@ -662,6 +674,148 @@ class AICullTool:
         self.app.set_input_folder(str(keep_folder))
         self.app.set_active_tool("ai_crop")
         self.app.log(f"AI Cull: ready to crop keep bucket at {keep_folder}.")
+
+    def _get_ai_crop_tool(self):
+        tool = self.app.tools_by_id.get("ai_crop")
+        if tool is None:
+            self.app.log("AI Cull Crop: AI Crop tool unavailable.")
+            return None
+        return tool
+
+    def _load_cached_cull_entries_by_filename(self, source_folder: Path) -> dict[str, dict]:
+        cache_path = source_folder / "VL_Debug" / "dance_cull_cache.json"
+        if not cache_path.exists():
+            return {}
+
+        try:
+            with cache_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return {}
+
+        entries = data.get("entries", {})
+        if not isinstance(entries, dict):
+            return {}
+
+        by_name: dict[str, dict] = {}
+        for key, entry in entries.items():
+            if not isinstance(entry, dict):
+                continue
+            image_name = ""
+            image_path = entry.get("image_path")
+            if isinstance(image_path, str) and image_path.strip():
+                image_name = Path(image_path).name
+            if not image_name:
+                image_name = str(key).split("|", 1)[0]
+            if not image_name:
+                continue
+            by_name[image_name.lower()] = entry
+        return by_name
+
+    def open_crop_settings_window(self):
+        ai_crop = self._get_ai_crop_tool()
+        if ai_crop is None:
+            return
+
+        if self.crop_settings_window is not None and self.crop_settings_window.winfo_exists():
+            self.crop_settings_window.deiconify()
+            self.crop_settings_window.lift()
+            self.crop_settings_window.focus_force()
+            return
+
+        win = tk.Toplevel(self.app.root)
+        win.title("Cropping Options")
+        win.geometry("420x290")
+        win.configure(bg="#2a2a2a")
+        self.crop_settings_window = win
+        win.protocol("WM_DELETE_WINDOW", lambda: (setattr(self, "crop_settings_window", None), win.destroy()))
+
+        pad = {"padx": 10, "pady": 4}
+        tk.Label(win, text="Cropping Options", bg="#2a2a2a", fg="white", font=("Arial", 11, "bold")).pack(anchor="w", **pad)
+
+        tk.Label(win, text="Ratio", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+        ttk.Combobox(
+            win,
+            textvariable=ai_crop.main_ratio_var,
+            values=["4:5", "5:7", "2:3", "1:1", "16:9"],
+            state="readonly",
+        ).pack(fill="x", **pad)
+
+        tk.Label(win, text="Margin Buffer %", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+        tk.Entry(win, textvariable=ai_crop.margin_var).pack(fill="x", **pad)
+
+        tk.Checkbutton(
+            win,
+            text="Auto rotate ratio",
+            variable=ai_crop.auto_rotate_var,
+            bg="#2a2a2a",
+            fg="white",
+            selectcolor="#444",
+        ).pack(anchor="w", **pad)
+
+        safe_frame = tk.Frame(win, bg="#2a2a2a")
+        safe_frame.pack(fill="x", padx=10, pady=4)
+        tk.Label(safe_frame, text="Safe Ratios:", bg="#2a2a2a", fg="white").pack(anchor="w")
+        tk.Checkbutton(safe_frame, text="2:3", variable=ai_crop.safe_23_var, bg="#2a2a2a", fg="white", selectcolor="#444").pack(side=tk.LEFT)
+        tk.Checkbutton(safe_frame, text="5:7", variable=ai_crop.safe_57_var, bg="#2a2a2a", fg="white", selectcolor="#444").pack(side=tk.LEFT)
+        tk.Checkbutton(safe_frame, text="1:1", variable=ai_crop.safe_11_var, bg="#2a2a2a", fg="white", selectcolor="#444").pack(side=tk.LEFT)
+
+        tk.Button(win, text="Close", command=win.destroy).pack(fill="x", padx=10, pady=(8, 8))
+
+    def _crop_paths_with_ai_crop(self, target_paths: list[Path], label: str):
+        if self.auto_running:
+            self.app.log("AI Cull Crop: wait for current AI-Cull run to finish before cropping.")
+            return
+
+        ai_crop = self._get_ai_crop_tool()
+        if ai_crop is None:
+            return
+        if not target_paths:
+            self.app.log(f"AI Cull Crop: no images available to crop ({label}).")
+            return
+
+        runtime = ai_crop.get_runtime_config()
+        if self.app.state.input_folder is not None:
+            runtime["cached_cull_entries"] = self._load_cached_cull_entries_by_filename(Path(self.app.state.input_folder))
+        else:
+            runtime["cached_cull_entries"] = {}
+
+        output_dir = ai_crop._get_crop_output_dir()
+        if output_dir is None:
+            self.app.log("AI Cull Crop: no input folder selected.")
+            return
+
+        saved = 0
+        total = len(target_paths)
+        self.app.log(f"AI Cull Crop: cropping {total} image(s) ({label})...")
+        for idx, image_path in enumerate(target_paths, start=1):
+            try:
+                result = ai_crop.evaluate_image_for_pipeline(Path(image_path), runtime)
+                crop_box = result.get("crop")
+                if crop_box is None:
+                    self.app.log(f"AI Cull Crop {idx}/{total}: {Path(image_path).name} -> no crop generated.")
+                    continue
+                image = self.app.image_repo.load_image(Path(image_path))
+                out_path = output_dir / Path(image_path).name
+                self.app.image_repo.save_crop(image, crop_box, out_path)
+                saved += 1
+                self.app.log(f"AI Cull Crop {idx}/{total}: {Path(image_path).name} -> {out_path.name}")
+            except Exception as exc:
+                self.app.log(f"AI Cull Crop {idx}/{total}: failed on {Path(image_path).name} ({exc})")
+
+        self.app.log(f"AI Cull Crop: saved {saved}/{total} crop(s) to {output_dir}.")
+        if self.app.state.current_image_path is not None:
+            self.on_image_changed()
+
+    def crop_current_image_from_ai_cull(self):
+        if self.app.state.current_image_path is None:
+            self.app.log("AI Cull Crop: no current image selected.")
+            return
+        self._crop_paths_with_ai_crop([Path(self.app.state.current_image_path)], "current image")
+
+    def crop_all_images_from_ai_cull(self):
+        paths = [Path(p) for p in self._get_loaded_image_paths()]
+        self._crop_paths_with_ai_crop(paths, "all loaded images")
 
     def _summarize_burst_groups(self, groups: list[list[Path]], total_images: int) -> dict:
         burst_groups = [g for g in groups if len(g) > 1]
@@ -3600,6 +3754,12 @@ class AICullTool:
             self.run_full_button.config(state="disabled" if running else "normal")
         if self.auto_button is not None:
             self.auto_button.config(state="disabled" if running else "normal")
+        if self.crop_options_button is not None:
+            self.crop_options_button.config(state="disabled" if running else "normal")
+        if self.crop_current_button is not None:
+            self.crop_current_button.config(state="disabled" if running else "normal")
+        if self.crop_all_button is not None:
+            self.crop_all_button.config(state="disabled" if running else "normal")
         if self.stop_button is not None:
             self.stop_button.config(state="normal" if running else "disabled")
 
