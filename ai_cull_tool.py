@@ -862,9 +862,17 @@ class AICullTool:
                     continue
                 self._show_ai_cull_crop_preview(Path(image_path), crop_box)
                 resolved_image_path = Path(image_path).resolve()
-                if current_path_resolved is not None and self.app.current_image is not None and resolved_image_path == current_path_resolved:
-                    image = self.app.current_image.copy()
-                elif self.app.current_image is not None and self.app.state.current_image_path is not None and Path(self.app.state.current_image_path).resolve() == resolved_image_path:
+                current_image_matches = (
+                    self.app.current_image is not None
+                    and (
+                        (current_path_resolved is not None and resolved_image_path == current_path_resolved)
+                        or (
+                            self.app.state.current_image_path is not None
+                            and Path(self.app.state.current_image_path).resolve() == resolved_image_path
+                        )
+                    )
+                )
+                if current_image_matches:
                     image = self.app.current_image.copy()
                 else:
                     image = self.app.image_repo.load_image(Path(image_path))
