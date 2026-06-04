@@ -85,6 +85,7 @@ class AICullTool:
     tool_id = "ai_cull"
     display_name = "AI Cull Tool"
     BURST_EVAL_WINDOW_GEOMETRY = "520x420"
+    CROP_SETTINGS_WINDOW_GEOMETRY = "420x290"
 
     DANCE_PICK_COLORS = [
         ("red", "#FF4D4D"),
@@ -678,11 +679,12 @@ class AICullTool:
     def _get_ai_crop_tool(self):
         tool = self.app.tools_by_id.get("ai_crop")
         if tool is None:
-            self.app.log("AI Cull Crop: AI Crop tool unavailable.")
+            self.app.log("AI Cull Crop: AI Crop tool not found. Please ensure the AI Crop tool is enabled.")
             return None
         return tool
 
     def _load_cached_cull_entries_by_filename(self, source_folder: Path) -> dict[str, dict]:
+        """Load dance-cull cache entries as a filename-keyed map for AI Crop reuse."""
         cache_path = source_folder / "VL_Debug" / "dance_cull_cache.json"
         if not cache_path.exists():
             return {}
@@ -690,7 +692,8 @@ class AICullTool:
         try:
             with cache_path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
-        except Exception:
+        except Exception as exc:
+            self.app.log(f"AI Cull Crop: failed to load cache from {cache_path} ({exc}).")
             return {}
 
         entries = data.get("entries", {})
@@ -706,6 +709,7 @@ class AICullTool:
             if isinstance(image_path, str) and image_path.strip():
                 image_name = Path(image_path).name
             if not image_name:
+                # Cache keys are stored as "<filename>|<mtime>|<rules_hash>".
                 image_name = str(key).split("|", 1)[0]
             if not image_name:
                 continue
@@ -725,10 +729,10 @@ class AICullTool:
 
         win = tk.Toplevel(self.app.root)
         win.title("Cropping Options")
-        win.geometry("420x290")
+        win.geometry(self.CROP_SETTINGS_WINDOW_GEOMETRY)
         win.configure(bg="#2a2a2a")
         self.crop_settings_window = win
-        win.protocol("WM_DELETE_WINDOW", lambda: (setattr(self, "crop_settings_window", None), win.destroy()))
+        win.protocol("WM_DELETE_WINDOW", self._close_crop_settings_window)
 
         pad = {"padx": 10, "pady": 4}
         tk.Label(win, text="Cropping Options", bg="#2a2a2a", fg="white", font=("Arial", 11, "bold")).pack(anchor="w", **pad)
@@ -760,7 +764,13 @@ class AICullTool:
         tk.Checkbutton(safe_frame, text="5:7", variable=ai_crop.safe_57_var, bg="#2a2a2a", fg="white", selectcolor="#444").pack(side=tk.LEFT)
         tk.Checkbutton(safe_frame, text="1:1", variable=ai_crop.safe_11_var, bg="#2a2a2a", fg="white", selectcolor="#444").pack(side=tk.LEFT)
 
-        tk.Button(win, text="Close", command=win.destroy).pack(fill="x", padx=10, pady=(8, 8))
+        tk.Button(win, text="Close", command=self._close_crop_settings_window).pack(fill="x", padx=10, pady=(8, 8))
+
+    def _close_crop_settings_window(self):
+        win = self.crop_settings_window
+        self.crop_settings_window = None
+        if win is not None and win.winfo_exists():
+            win.destroy()
 
     def _crop_paths_with_ai_crop(self, target_paths: list[Path], label: str):
         if self.auto_running:
@@ -780,22 +790,29 @@ class AICullTool:
         else:
             runtime["cached_cull_entries"] = {}
 
-        output_dir = ai_crop._get_crop_output_dir()
+        output_dir = self._get_ai_cull_crop_output_dir()
         if output_dir is None:
-            self.app.log("AI Cull Crop: no input folder selected.")
+            self.app.log("AI Cull Crop: no input folder selected. Please select an input folder before cropping.")
             return
 
         saved = 0
         total = len(target_paths)
         self.app.log(f"AI Cull Crop: cropping {total} image(s) ({label})...")
+        current_path = Path(self.app.state.current_image_path) if self.app.state.current_image_path is not None else None
+        current_path_resolved = current_path.resolve() if current_path is not None else None
         for idx, image_path in enumerate(target_paths, start=1):
             try:
                 result = ai_crop.evaluate_image_for_pipeline(Path(image_path), runtime)
                 crop_box = result.get("crop")
                 if crop_box is None:
-                    self.app.log(f"AI Cull Crop {idx}/{total}: {Path(image_path).name} -> no crop generated.")
+                    reason = str(result.get("hero_reason", "unknown reason"))
+                    self.app.log(f"AI Cull Crop {idx}/{total}: {Path(image_path).name} -> no crop generated ({reason}).")
                     continue
-                image = self.app.image_repo.load_image(Path(image_path))
+                resolved_image_path = Path(image_path).resolve()
+                if current_path_resolved is not None and self.app.current_image is not None and resolved_image_path == current_path_resolved:
+                    image = self.app.current_image.copy()
+                else:
+                    image = self.app.image_repo.load_image(Path(image_path))
                 out_path = output_dir / Path(image_path).name
                 self.app.image_repo.save_crop(image, crop_box, out_path)
                 saved += 1
@@ -804,8 +821,6 @@ class AICullTool:
                 self.app.log(f"AI Cull Crop {idx}/{total}: failed on {Path(image_path).name} ({exc})")
 
         self.app.log(f"AI Cull Crop: saved {saved}/{total} crop(s) to {output_dir}.")
-        if self.app.state.current_image_path is not None:
-            self.on_image_changed()
 
     def crop_current_image_from_ai_cull(self):
         if self.app.state.current_image_path is None:
@@ -816,6 +831,17 @@ class AICullTool:
     def crop_all_images_from_ai_cull(self):
         paths = [Path(p) for p in self._get_loaded_image_paths()]
         self._crop_paths_with_ai_crop(paths, "all loaded images")
+
+    def _get_ai_cull_crop_output_dir(self) -> Path | None:
+        """Return crop output dir, preferring Output/Keep/Crops when Keep exists."""
+        if self.app.state.input_folder is None:
+            return None
+        source_folder = Path(self.app.state.input_folder)
+        keep_folder = source_folder / "Output" / "Keep"
+        crop_source = keep_folder if keep_folder.is_dir() else source_folder
+        out_dir = crop_source / "Crops"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
 
     def _summarize_burst_groups(self, groups: list[list[Path]], total_images: int) -> dict:
         burst_groups = [g for g in groups if len(g) > 1]
