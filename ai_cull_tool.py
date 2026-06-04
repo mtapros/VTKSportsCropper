@@ -777,10 +777,9 @@ class AICullTool:
             return None
 
         folder = Path(self.app.state.input_folder)
-        if folder.name == "Keep" and folder.parent.name == "Output":
-            return folder.parent.parent
-        if folder.name == "Crops" and folder.parent.name == "Keep" and folder.parent.parent.name == "Output":
-            return folder.parent.parent.parent
+        keep_folder = folder.parent if folder.name == "Crops" else folder
+        if keep_folder.name == "Keep" and keep_folder.parent.name == "Output":
+            return keep_folder.parent.parent
         return folder
 
     def _get_ai_cull_keep_folder(self) -> Path | None:
@@ -788,7 +787,9 @@ class AICullTool:
             return None
 
         folder = Path(self.app.state.input_folder)
-        if folder.name == "Keep" and folder.is_dir():
+        if folder.name == "Crops" and folder.parent.name == "Keep":
+            folder = folder.parent
+        if folder.name == "Keep":
             return folder
 
         source_folder = self._get_ai_cull_crop_source_folder()
@@ -808,7 +809,7 @@ class AICullTool:
         self.app.ui.clear_debug_views()
         self.app.ui.show_image(self.app.current_image)
 
-        visible_paths = [Path(p).resolve() for p in getattr(self.app.state, "image_paths", [])]
+        visible_paths = [Path(p).resolve() for p in self.app.state.image_paths]
         try:
             preview_index = visible_paths.index(Path(image_path).resolve())
         except ValueError:
@@ -849,8 +850,6 @@ class AICullTool:
         saved = 0
         total = len(target_paths)
         self.app.log(f"AI Cull Crop: cropping {total} image(s) ({label})...")
-        current_path = Path(self.app.state.current_image_path) if self.app.state.current_image_path is not None else None
-        current_path_resolved = current_path.resolve() if current_path is not None else None
         for idx, image_path in enumerate(target_paths, start=1):
             try:
                 self.app.log(f"AI Cull Crop {idx}/{total}: preparing {Path(image_path).name}...")
@@ -864,13 +863,8 @@ class AICullTool:
                 resolved_image_path = Path(image_path).resolve()
                 current_image_matches = (
                     self.app.current_image is not None
-                    and (
-                        (current_path_resolved is not None and resolved_image_path == current_path_resolved)
-                        or (
-                            self.app.state.current_image_path is not None
-                            and Path(self.app.state.current_image_path).resolve() == resolved_image_path
-                        )
-                    )
+                    and self.app.state.current_image_path is not None
+                    and Path(self.app.state.current_image_path).resolve() == resolved_image_path
                 )
                 if current_image_matches:
                     image = self.app.current_image.copy()
