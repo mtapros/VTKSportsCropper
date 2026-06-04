@@ -772,7 +772,57 @@ class AICullTool:
         if win is not None and win.winfo_exists():
             win.destroy()
 
-    def _crop_paths_with_ai_crop(self, target_paths: list[Path], label: str):
+    def _get_ai_cull_crop_source_folder(self) -> Path | None:
+        if self.app.state.input_folder is None:
+            return None
+
+        folder = Path(self.app.state.input_folder)
+        if folder.name == "Keep" and folder.parent.name == "Output":
+            return folder.parent.parent
+        if folder.name == "Crops" and folder.parent.name == "Keep" and folder.parent.parent.name == "Output":
+            return folder.parent.parent.parent
+        return folder
+
+    def _get_ai_cull_keep_folder(self) -> Path | None:
+        if self.app.state.input_folder is None:
+            return None
+
+        folder = Path(self.app.state.input_folder)
+        if folder.name == "Keep" and folder.is_dir():
+            return folder
+
+        source_folder = self._get_ai_cull_crop_source_folder()
+        if source_folder is None:
+            return None
+
+        keep_folder = source_folder / "Output" / "Keep"
+        if keep_folder.is_dir():
+            return keep_folder
+        return None
+
+    def _show_ai_cull_crop_preview(self, image_path: Path, crop_box: BoundingBox):
+        self.app.load_image(Path(image_path))
+        self.app.set_manual_boxes([])
+        self.app.set_manual_selected_ids(set())
+        self.app.set_overlays([CropBox(name="AI_Cull_Crop", bbox=crop_box, color="#00FF00")])
+        self.app.ui.clear_debug_views()
+        self.app.ui.show_image(self.app.current_image)
+
+        visible_paths = [Path(p).resolve() for p in getattr(self.app.state, "image_paths", [])]
+        try:
+            preview_index = visible_paths.index(Path(image_path).resolve())
+        except ValueError:
+            preview_index = None
+        if preview_index is not None:
+            self.app.ui.highlight_thumbnail_index(preview_index)
+
+        try:
+            self.app.root.update_idletasks()
+            self.app.root.update()
+        except Exception:
+            pass
+
+    def _crop_paths_with_ai_crop(self, target_paths: list[Path], label: str, cache_source_folder: Path | None = None):
         if self.auto_running:
             self.app.log("AI Cull Crop: wait for current AI-Cull run to finish before cropping.")
             return
@@ -785,8 +835,9 @@ class AICullTool:
             return
 
         runtime = ai_crop.get_runtime_config()
-        if self.app.state.input_folder is not None:
-            runtime["cached_cull_entries"] = self._load_cached_cull_entries_by_filename(Path(self.app.state.input_folder))
+        cache_folder = cache_source_folder or self._get_ai_cull_crop_source_folder()
+        if cache_folder is not None:
+            runtime["cached_cull_entries"] = self._load_cached_cull_entries_by_filename(Path(cache_folder))
         else:
             runtime["cached_cull_entries"] = {}
 
@@ -802,14 +853,18 @@ class AICullTool:
         current_path_resolved = current_path.resolve() if current_path is not None else None
         for idx, image_path in enumerate(target_paths, start=1):
             try:
+                self.app.log(f"AI Cull Crop {idx}/{total}: preparing {Path(image_path).name}...")
                 result = ai_crop.evaluate_image_for_pipeline(Path(image_path), runtime)
                 crop_box = result.get("crop")
                 if crop_box is None:
                     reason = str(result.get("hero_reason", "unknown reason"))
                     self.app.log(f"AI Cull Crop {idx}/{total}: {Path(image_path).name} -> no crop generated ({reason}).")
                     continue
+                self._show_ai_cull_crop_preview(Path(image_path), crop_box)
                 resolved_image_path = Path(image_path).resolve()
                 if current_path_resolved is not None and self.app.current_image is not None and resolved_image_path == current_path_resolved:
+                    image = self.app.current_image.copy()
+                elif self.app.current_image is not None and self.app.state.current_image_path is not None and Path(self.app.state.current_image_path).resolve() == resolved_image_path:
                     image = self.app.current_image.copy()
                 else:
                     image = self.app.image_repo.load_image(Path(image_path))
@@ -829,16 +884,26 @@ class AICullTool:
         self._crop_paths_with_ai_crop([Path(self.app.state.current_image_path)], "current image")
 
     def crop_all_images_from_ai_cull(self):
+        source_folder = self._get_ai_cull_crop_source_folder()
+        keep_folder = self._get_ai_cull_keep_folder()
+        if keep_folder is not None:
+            keeper_paths = [Path(p) for p in self.app.image_repo.list_images(keep_folder)]
+            if keeper_paths:
+                self.app.log(f"AI Cull Crop: using workflow keepers from {keep_folder}.")
+                self._crop_paths_with_ai_crop(keeper_paths, "workflow keepers", cache_source_folder=source_folder)
+                return
         paths = [Path(p) for p in self._get_loaded_image_paths()]
-        self._crop_paths_with_ai_crop(paths, "all loaded images")
+        self._crop_paths_with_ai_crop(paths, "all loaded images", cache_source_folder=source_folder)
 
     def _get_ai_cull_crop_output_dir(self) -> Path | None:
         """Return crop output dir, preferring Output/Keep/Crops when Keep exists."""
         if self.app.state.input_folder is None:
             return None
-        source_folder = Path(self.app.state.input_folder)
-        keep_folder = source_folder / "Output" / "Keep"
-        crop_source = keep_folder if keep_folder.is_dir() else source_folder
+        source_folder = self._get_ai_cull_crop_source_folder()
+        if source_folder is None:
+            return None
+        keep_folder = self._get_ai_cull_keep_folder()
+        crop_source = keep_folder if keep_folder is not None else source_folder
         out_dir = crop_source / "Crops"
         out_dir.mkdir(parents=True, exist_ok=True)
         return out_dir
