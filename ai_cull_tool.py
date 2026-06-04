@@ -2528,6 +2528,63 @@ class AICullTool:
                 pass
         return canvas
 
+    def _annotate_burst_round_winner(
+        self,
+        grid_path: Path,
+        winner_label: str,
+        candidate_count: int,
+    ) -> None:
+        label = str(winner_label or "").strip().upper()
+        if not label:
+            return
+
+        labels = self.VL_BURST_PANEL_LABELS[: max(0, int(candidate_count))]
+        if label not in labels:
+            return
+
+        panel_w = 560
+        panel_h = 480
+        gap = 18
+        cols, _ = self._burst_round_layout(len(labels))
+        panel_index = labels.index(label)
+        row = panel_index // cols
+        col = panel_index % cols
+        px = gap + col * (panel_w + gap)
+        py = gap + row * (panel_h + gap)
+
+        with Image.open(grid_path) as img:
+            canvas = img.convert("RGB")
+        draw = ImageDraw.Draw(canvas, "RGBA")
+
+        panel_box = [px + 6, py + 6, px + panel_w - 6, py + panel_h - 6]
+        draw.rounded_rectangle(
+            panel_box,
+            radius=18,
+            outline=(78, 224, 121, 255),
+            width=10,
+        )
+
+        marker_r = 34
+        marker_cx = px + panel_w - 56
+        marker_cy = py + 56
+        draw.ellipse(
+            [marker_cx - marker_r, marker_cy - marker_r, marker_cx + marker_r, marker_cy + marker_r],
+            fill=(56, 189, 89, 245),
+            outline=(238, 255, 244, 255),
+            width=4,
+        )
+        draw.line(
+            [
+                (marker_cx - 15, marker_cy + 2),
+                (marker_cx - 3, marker_cy + 16),
+                (marker_cx + 18, marker_cy - 10),
+            ],
+            fill=(255, 255, 255, 255),
+            width=8,
+            joint="curve",
+        )
+        canvas.save(grid_path, format="JPEG", quality=92)
+
     def _burst_round_layout(self, count: int) -> tuple[int, int]:
         if count <= 2:
             return (2, 1)
@@ -2671,10 +2728,24 @@ class AICullTool:
         except Exception:
             confidence = 0.0
 
+        winner_label = ""
+        winner_path = str(winner["path"])
+        for label, item in label_to_item.items():
+            if str(item.get("path", "")) == winner_path:
+                winner_label = label
+                break
+
+        if winner_label:
+            try:
+                self._annotate_burst_round_winner(grid_path, winner_label, len(round_items))
+            except Exception:
+                pass
+
         return winner, {
             "round": round_index,
             "grid_path": str(grid_path),
-            "winner_path": str(winner["path"]),
+            "winner_path": winner_path,
+            "winner_label": winner_label,
             "runner_up_paths": runner_ups,
             "reason": str(parsed.get("reason", "")).strip(),
             "confidence": max(0.0, min(1.0, confidence)),
@@ -3348,6 +3419,47 @@ class AICullTool:
             self.current_score = score
         self._refresh_accounting_labels()
 
+    def _route_full_workflow_outputs(self):
+        source_folder = self.app.state.input_folder
+        if source_folder is None:
+            self.app.log("AI Cull: no input folder selected.")
+            return
+
+        output_root = source_folder / "Output"
+        for bucket_name in ("Keep", "Maybe", "Reject", "Reject-Bursts"):
+            (output_root / bucket_name).mkdir(parents=True, exist_ok=True)
+
+        copied = {"Keep": 0, "Maybe": 0, "Reject": 0, "Reject-Bursts": 0}
+        eligible_paths = [Path(p) for p in self._get_eligible_paths()]
+        for path in eligible_paths:
+            result = self.ai_processed_results.get(str(Path(path).resolve()))
+            if not isinstance(result, dict):
+                continue
+            decision = str(result.get("decision", "Reject"))
+            score = float(result.get("score", 0.0))
+            self._copy_image_to_decision_folder(path, decision, score, burst_suppressed=False)
+            copied[self._decision_bucket_name(decision)] += 1
+
+        if bool(self.enable_burst_var.get()):
+            for path_value in sorted(self.burst_removed_paths):
+                burst_path = Path(path_value)
+                if not burst_path.exists():
+                    continue
+                self._copy_image_to_decision_folder(
+                    burst_path,
+                    "Reject",
+                    0.0,
+                    burst_suppressed=True,
+                )
+                copied["Reject-Bursts"] += 1
+
+        total = sum(copied.values())
+        self.app.log(
+            "AI Cull Full Workflow: wrote outputs "
+            f"Keep={copied['Keep']} Maybe={copied['Maybe']} "
+            f"Reject={copied['Reject']} Reject-Bursts={copied['Reject-Bursts']} total={total}"
+        )
+
     def _set_worker_preview_image(self, image_path: Path):
         no_current_image = self.app.current_image is None
         no_current_path = self.app.state.current_image_path is None
@@ -3537,14 +3649,14 @@ class AICullTool:
             if kind == "result":
                 _, image_path, result, idx, total = event
                 self._store_ai_result(Path(image_path), result)
-                if self.auto_mode == "run_current_image":
+                if self.auto_mode in {"run_current_image", "run_cull", "run_full_workflow"}:
                     self._apply_worker_result_to_preview(Path(image_path), result)
                 decision = str(result.get("decision", "Reject"))
                 score = float(result.get("score", 0.0))
                 self.app.log(f"AI Cull {idx}/{total}: {Path(image_path).name} -> {decision} ({score:.1f})")
             elif kind == "status":
                 _, image_path, stage_message, idx, total = event
-                if self.auto_mode == "run_current_image":
+                if self.auto_mode in {"run_current_image", "run_cull", "run_full_workflow"}:
                     try:
                         self._set_worker_preview_image(Path(image_path))
                     except Exception:
@@ -3620,7 +3732,10 @@ class AICullTool:
                 if self._pending_full_workflow_after_burst:
                     self._pending_full_workflow_after_burst = False
                     pending = [Path(p) for p in self.burst_remaining_paths if str(Path(p).resolve()) not in self.ai_processed_results]
-                    self._start_ai_worker(pending, "run_full_workflow")
+                    if pending:
+                        self._start_ai_worker(pending, "run_full_workflow")
+                    else:
+                        self._route_full_workflow_outputs()
             elif kind == "burst_error":
                 _, message = event
                 self._finish_auto_cull(cancelled=True)
@@ -3628,7 +3743,10 @@ class AICullTool:
                 self.app.log(f"AI Cull Burst Evaluate failed: {message}")
             elif kind == "done":
                 _, processed, cancelled, total = event
+                completed_mode = self.auto_mode
                 self._finish_auto_cull(cancelled=bool(cancelled))
+                if not cancelled and completed_mode == "run_full_workflow":
+                    self._route_full_workflow_outputs()
                 if cancelled:
                     self.app.log(f"AI Cull: stopped after {processed}/{total} image(s).")
                 else:
@@ -3667,6 +3785,9 @@ class AICullTool:
             self.evaluate_bursts()
             return
         pending = [p for p in self._get_eligible_paths() if str(p.resolve()) not in self.ai_processed_results]
+        if not pending:
+            self._route_full_workflow_outputs()
+            return
         self._start_ai_worker(pending, "run_full_workflow")
 
     def rerun(self):
