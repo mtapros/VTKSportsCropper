@@ -12,6 +12,9 @@ from tkinter.scrolledtext import ScrolledText
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 from burst_service import (
+    DEFAULT_BURST_THUMBNAIL_SIZE,
+    MAX_BURST_THUMBNAIL_SIZE,
+    MIN_BURST_THUMBNAIL_SIZE,
     BurstAnalysis,
     BurstSettingsStore,
     BurstToolSettings,
@@ -30,8 +33,6 @@ _RENDER_BATCH_DELAY_MS = 10
 _LOG_PROGRESS_EVERY = 25
 _THUMBNAIL_BATCH_SIZE = 10
 _THUMBNAIL_BATCH_SLEEP_SEC = 0.03
-_MAIN_THUMB_SIDE = 576
-_REVIEW_THUMB_SIDE = 576
 _MAIN_THUMB_CANVAS_EXTRA_HEIGHT = 120
 _THUMBNAIL_PRIORITY_ROW_MULTIPLIER = 1000
 _THUMBNAIL_PRIORITY_REVIEW_OFFSET = -100000
@@ -60,6 +61,7 @@ class BurstDetectionTool:
         self.source_folder_var = tk.StringVar(value=default_folder)
         self.fps_threshold_var = tk.StringVar(value="8")
         self.keep_per_burst_var = tk.StringVar(value="1")
+        self.thumbnail_size_var = tk.IntVar(value=DEFAULT_BURST_THUMBNAIL_SIZE)
         self.summary_var = tk.StringVar(value="No burst analysis yet.")
 
         self.criteria_text: ScrolledText | None = None
@@ -93,6 +95,7 @@ class BurstDetectionTool:
         self._thumbnail_worker.start()
 
         self._preview_windows: dict[tuple[int, str], dict] = {}
+        self._thumb_side = DEFAULT_BURST_THUMBNAIL_SIZE
 
     def build_panel(self, parent):
         self.panel = tk.Frame(parent, bg="#2a2a2a")
@@ -107,6 +110,21 @@ class BurstDetectionTool:
 
         tk.Label(self.panel, text="# Keep Per Burst", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
         tk.Entry(self.panel, textvariable=self.keep_per_burst_var).pack(fill="x", **pad)
+
+        tk.Label(self.panel, text="Thumbnail Size", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+        tk.Scale(
+            self.panel,
+            from_=MIN_BURST_THUMBNAIL_SIZE,
+            to=MAX_BURST_THUMBNAIL_SIZE,
+            orient="horizontal",
+            resolution=8,
+            variable=self.thumbnail_size_var,
+            bg="#2a2a2a",
+            fg="white",
+            troughcolor="#444444",
+            highlightthickness=0,
+        ).pack(fill="x", padx=10, pady=(0, 2))
+        tk.Button(self.panel, text="Apply Thumb Size", command=self.apply_thumbnail_size).pack(fill="x", padx=10, pady=(0, 6))
 
         buttons = tk.Frame(self.panel, bg="#2a2a2a")
         buttons.pack(fill="x", padx=10, pady=(6, 2))
@@ -161,6 +179,7 @@ class BurstDetectionTool:
         self.fps_threshold_var.set(str(settings.fps_threshold))
         self.keep_per_burst_var.set(str(settings.keep_per_burst))
         self._set_winner_criteria_text(settings.winner_criteria)
+        self._set_thumbnail_size(settings.thumbnail_size, rerender=self._active and bool(self.rows), log=False)
         self._sync_source_folder_from_app()
 
     def get_profile_data(self):
@@ -178,6 +197,7 @@ class BurstDetectionTool:
             fps_threshold=self._parse_fps_threshold(),
             keep_per_burst=self._parse_keep_per_burst(),
             winner_criteria=self._read_winner_criteria_text(),
+            thumbnail_size=self._parse_thumbnail_size(),
         )
         self.settings_store.save_profile(profile_name, settings)
         if log:
@@ -249,6 +269,39 @@ class BurstDetectionTool:
             return max(1, int(self.keep_per_burst_var.get().strip() or "1"))
         except Exception:
             return 1
+
+    def _parse_thumbnail_size(self) -> int:
+        try:
+            value = int(float(self.thumbnail_size_var.get()))
+        except Exception:
+            value = DEFAULT_BURST_THUMBNAIL_SIZE
+        return max(MIN_BURST_THUMBNAIL_SIZE, min(MAX_BURST_THUMBNAIL_SIZE, value))
+
+    def _set_thumbnail_size(self, side: int, rerender: bool, log: bool) -> bool:
+        normalized = max(MIN_BURST_THUMBNAIL_SIZE, min(MAX_BURST_THUMBNAIL_SIZE, int(side)))
+        changed = normalized != self._thumb_side
+        self._thumb_side = normalized
+        self.thumbnail_size_var.set(normalized)
+        if rerender and changed:
+            self._thumbnail_epoch += 1
+            if self.preview_rows_frame is not None and self.preview_rows_frame.winfo_exists():
+                self._start_incremental_render()
+            self._rerender_open_review_windows()
+        if log:
+            if changed:
+                self.app.log(f"Burst Detection: thumbnail size set to {normalized}px.")
+            else:
+                self.app.log(f"Burst Detection: thumbnail size already {normalized}px.")
+        return changed
+
+    def apply_thumbnail_size(self):
+        self._set_thumbnail_size(self._parse_thumbnail_size(), rerender=True, log=True)
+
+    def _rerender_open_review_windows(self):
+        for row in self.rows:
+            review_inner = row.get("review_inner")
+            if review_inner is not None and review_inner.winfo_exists():
+                self._render_row_cards(row, review_inner, self._thumb_side, context="review")
 
     def _read_winner_criteria_text(self) -> str:
         if self.criteria_text is not None and self.criteria_text.winfo_exists():
@@ -426,6 +479,7 @@ class BurstDetectionTool:
                 self.preview_canvas.yview_moveto(0)
 
     def _render_single_row(self, row: dict):
+        side = self._thumb_side
         row_frame = tk.Frame(
             self.preview_rows_frame,
             bg="#1a1a1a",
@@ -484,7 +538,7 @@ class BurstDetectionTool:
             thumbs_host,
             bg="#181818",
             highlightthickness=0,
-            height=_MAIN_THUMB_SIDE + _MAIN_THUMB_CANVAS_EXTRA_HEIGHT,
+            height=side + _MAIN_THUMB_CANVAS_EXTRA_HEIGHT,
         )
         thumbs_scroll = tk.Scrollbar(thumbs_host, orient="horizontal", command=thumbs_canvas.xview)
         thumbs_canvas.configure(xscrollcommand=thumbs_scroll.set)
@@ -499,7 +553,7 @@ class BurstDetectionTool:
         row["thumbs_canvas"] = thumbs_canvas
         row["thumbs_scroll"] = thumbs_scroll
 
-        self._render_row_cards(row, thumbs_frame, _MAIN_THUMB_SIDE, context="main")
+        self._render_row_cards(row, thumbs_frame, side, context="main")
         self._update_row_status(row)
 
     def _render_row_cards(self, row: dict, host, side: int, context: str):
@@ -822,7 +876,7 @@ class BurstDetectionTool:
         row["review_window"] = window
         row["review_inner"] = inner
         row["review_cards"] = {}
-        self._render_row_cards(row, inner, _REVIEW_THUMB_SIDE, context="review")
+        self._render_row_cards(row, inner, self._thumb_side, context="review")
 
         def close_review():
             row["review_cards"] = {}

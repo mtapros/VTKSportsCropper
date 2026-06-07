@@ -17,6 +17,9 @@ DEFAULT_BURST_WINNER_CRITERIA = (
     "minimal motion blur",
     "most reliably usable if unsure",
 )
+DEFAULT_BURST_THUMBNAIL_SIZE = 288
+MIN_BURST_THUMBNAIL_SIZE = 120
+MAX_BURST_THUMBNAIL_SIZE = 768
 
 
 @dataclass
@@ -43,6 +46,7 @@ class BurstToolSettings:
     fps_threshold: float = 8.0
     keep_per_burst: int = 1
     winner_criteria: str = ""
+    thumbnail_size: int = DEFAULT_BURST_THUMBNAIL_SIZE
 
 
 class BurstSettingsStore:
@@ -58,6 +62,10 @@ class BurstSettingsStore:
             keep_per_burst=max(1, int(data.get("keep_per_burst", 1))),
             winner_criteria=str(data.get("winner_criteria", default_winner_criteria_text())).strip()
             or default_winner_criteria_text(),
+            thumbnail_size=max(
+                MIN_BURST_THUMBNAIL_SIZE,
+                min(MAX_BURST_THUMBNAIL_SIZE, int(data.get("thumbnail_size", DEFAULT_BURST_THUMBNAIL_SIZE))),
+            ),
         )
 
     def save_profile(self, profile_name: str, settings: BurstToolSettings) -> None:
@@ -67,6 +75,10 @@ class BurstSettingsStore:
             "fps_threshold": max(0.1, float(settings.fps_threshold)),
             "keep_per_burst": max(1, int(settings.keep_per_burst)),
             "winner_criteria": str(settings.winner_criteria or "").strip() or default_winner_criteria_text(),
+            "thumbnail_size": max(
+                MIN_BURST_THUMBNAIL_SIZE,
+                min(MAX_BURST_THUMBNAIL_SIZE, int(settings.thumbnail_size)),
+            ),
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
