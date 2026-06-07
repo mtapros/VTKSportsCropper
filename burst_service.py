@@ -2,12 +2,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import json
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 
 SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
+DEFAULT_BURST_WINNER_CRITERIA = (
+    "sharpest",
+    "cleanest",
+    "strongest timing",
+    "clear subject visibility",
+    "minimal motion blur",
+    "most reliably usable if unsure",
+)
 
 
 @dataclass
@@ -29,12 +38,96 @@ class BurstAnalysis:
         return max(0, self.total_images - self.burst_images)
 
 
+@dataclass
+class BurstToolSettings:
+    fps_threshold: float = 8.0
+    keep_per_burst: int = 1
+    winner_criteria: str = ""
+
+
+class BurstSettingsStore:
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    def load_profile(self, profile_name: str) -> BurstToolSettings:
+        profile_key = str(profile_name or "").strip() or "Generic Sport"
+        raw = self._load_all()
+        data = raw.get(profile_key, {}) if isinstance(raw, dict) else {}
+        return BurstToolSettings(
+            fps_threshold=max(0.1, float(data.get("fps_threshold", 8.0))),
+            keep_per_burst=max(1, int(data.get("keep_per_burst", 1))),
+            winner_criteria=str(data.get("winner_criteria", default_winner_criteria_text())).strip()
+            or default_winner_criteria_text(),
+        )
+
+    def save_profile(self, profile_name: str, settings: BurstToolSettings) -> None:
+        profile_key = str(profile_name or "").strip() or "Generic Sport"
+        raw = self._load_all()
+        raw[profile_key] = {
+            "fps_threshold": max(0.1, float(settings.fps_threshold)),
+            "keep_per_burst": max(1, int(settings.keep_per_burst)),
+            "winner_criteria": str(settings.winner_criteria or "").strip() or default_winner_criteria_text(),
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+
+    def _load_all(self) -> dict:
+        if not self.path.exists():
+            return {}
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+
+def default_winner_criteria_text() -> str:
+    return "\n".join(DEFAULT_BURST_WINNER_CRITERIA)
+
+
+def normalize_winner_criteria_lines(text: str | None, include_defaults: bool = True) -> list[str]:
+    raw_lines: list[str] = []
+    if include_defaults:
+        raw_lines.extend(DEFAULT_BURST_WINNER_CRITERIA)
+    if text:
+        raw_lines.extend(str(text).replace("\r", "\n").split("\n"))
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for line in raw_lines:
+        clean = str(line or "").strip().lstrip("-•*").strip()
+        if not clean:
+            continue
+        key = clean.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(clean)
+    return normalized
+
+
 def list_supported_images(folder: Path) -> list[Path]:
     folder = Path(folder)
     if not folder.exists() or not folder.is_dir():
         return []
     paths = [path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES]
     return sorted(paths, key=lambda p: p.name.lower())
+
+
+def load_rgb_image(image_path: Path) -> Image.Image:
+    with Image.open(Path(image_path)) as img:
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        return img.copy()
+
+
+def build_square_thumbnail(image_path: Path, side: int, background: tuple[int, int, int] = (20, 20, 20)) -> Image.Image:
+    side = max(1, int(side))
+    img = load_rgb_image(Path(image_path))
+    img.thumbnail((side, side), Image.LANCZOS)
+    canvas = Image.new("RGB", (side, side), background)
+    offset = ((side - img.width) // 2, (side - img.height) // 2)
+    canvas.paste(img, offset)
+    return canvas
 
 
 def extract_capture_timestamp(image_path: Path) -> tuple[float, str]:

@@ -343,12 +343,33 @@ class LMStudioClient:
         image_paths: list[str | Path],
         temperature: float = 0.1,
         max_tokens: int = 500,
+        additional_criteria: str = "",
     ) -> dict:
         if not image_paths:
             raise ValueError("No burst frames provided")
 
         frame_names = [Path(p).name for p in image_paths]
         frame_list_text = "\n".join(f"- {name}" for name in frame_names)
+
+        criteria_lines = [
+            "sharpest",
+            "cleanest",
+            "strongest timing",
+            "clear subject visibility",
+            "minimal motion blur",
+            "most reliably usable if unsure",
+        ]
+        seen_criteria = {line.casefold() for line in criteria_lines}
+        for raw_line in str(additional_criteria or "").replace("\r", "\n").split("\n"):
+            clean = raw_line.strip().lstrip("-•*").strip()
+            if not clean:
+                continue
+            key = clean.casefold()
+            if key in seen_criteria:
+                continue
+            seen_criteria.add(key)
+            criteria_lines.append(clean)
+        criteria_prompt = "\n".join(f"- {line}" for line in criteria_lines)
 
         system_prompt = (
             "You are a sports burst-frame selector.\n"
@@ -365,9 +386,8 @@ class LMStudioClient:
             "- alternates and rejects must be arrays of provided filenames (can be empty).\n"
             "- confidence must be a number between 0 and 1.\n"
             "- reason must be one short sentence.\n"
-            "- Prefer the sharpest, cleanest, strongest-timing frame.\n"
-            "- Prefer clear subject visibility and minimal motion blur.\n"
-            "- If unsure, choose the frame that is most reliably usable."
+            "Apply these selection criteria:\n"
+            f"{criteria_prompt}"
         )
 
         user_prompt = (
