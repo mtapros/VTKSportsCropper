@@ -30,8 +30,11 @@ _RENDER_BATCH_DELAY_MS = 10
 _LOG_PROGRESS_EVERY = 25
 _THUMBNAIL_BATCH_SIZE = 10
 _THUMBNAIL_BATCH_SLEEP_SEC = 0.03
-_MAIN_THUMB_SIDE = 96
-_REVIEW_THUMB_SIDE = 220
+_MAIN_THUMB_SIDE = 192
+_REVIEW_THUMB_SIDE = 440
+_MAIN_THUMB_CANVAS_EXTRA_HEIGHT = 92
+_THUMBNAIL_PRIORITY_ROW_MULTIPLIER = 1000
+_THUMBNAIL_PRIORITY_REVIEW_OFFSET = -100000
 _PREVIEW_SCREEN_FRACTION = 0.92
 _LIME = "#7CFF4D"
 _LIME_RGB = (124, 255, 77)
@@ -331,6 +334,7 @@ class BurstDetectionTool:
                 "review_cards": {},
                 "review_window": None,
                 "review_inner": None,
+                "review_vl_button": None,
                 "review_status_label": None,
                 "vl_meta": {},
             }
@@ -474,9 +478,26 @@ class BurstDetectionTool:
         )
         status.pack(fill="x", padx=10, pady=(0, 4))
 
-        thumbs_frame = tk.Frame(row_frame, bg="#181818")
-        thumbs_frame.pack(fill="x", padx=6, pady=(0, 6))
+        thumbs_host = tk.Frame(row_frame, bg="#181818")
+        thumbs_host.pack(fill="x", padx=6, pady=(0, 6))
+        thumbs_canvas = tk.Canvas(
+            thumbs_host,
+            bg="#181818",
+            highlightthickness=0,
+            height=_MAIN_THUMB_SIDE + _MAIN_THUMB_CANVAS_EXTRA_HEIGHT,
+        )
+        thumbs_scroll = tk.Scrollbar(thumbs_host, orient="horizontal", command=thumbs_canvas.xview)
+        thumbs_canvas.configure(xscrollcommand=thumbs_scroll.set)
+        thumbs_canvas.pack(fill="x", expand=True)
+        thumbs_scroll.pack(fill="x")
+
+        thumbs_frame = tk.Frame(thumbs_canvas, bg="#181818")
+        thumbs_canvas.create_window((0, 0), window=thumbs_frame, anchor="nw")
+        thumbs_frame.bind("<Configure>", lambda _event, c=thumbs_canvas: c.configure(scrollregion=c.bbox("all")))
+
         row["thumbs_frame"] = thumbs_frame
+        row["thumbs_canvas"] = thumbs_canvas
+        row["thumbs_scroll"] = thumbs_scroll
 
         self._render_row_cards(row, thumbs_frame, _MAIN_THUMB_SIDE, context="main")
         self._update_row_status(row)
@@ -487,8 +508,8 @@ class BurstDetectionTool:
 
         cards: dict[str, dict] = {}
         total = len(row["paths"])
-        row_index = row["index"] - 1
-        columns = 1 if context == "main" else 4
+        row_index = self._row_to_index(row)
+        columns = 2 if context == "review" else 1
 
         for idx, image_path in enumerate(row["paths"], start=1):
             path = Path(image_path)
@@ -496,7 +517,7 @@ class BurstDetectionTool:
 
             card = tk.Frame(host, bg="#202020", bd=2, relief="solid", highlightbackground="#444444", highlightthickness=2)
             if context == "main":
-                card.pack(side="left", padx=4, pady=4)
+                card.pack(side="left", padx=8, pady=6)
             else:
                 grid_row = (idx - 1) // columns
                 grid_col = (idx - 1) % columns
@@ -506,7 +527,7 @@ class BurstDetectionTool:
             header.pack(fill="x", padx=4, pady=(4, 2))
             winner_button = tk.Button(
                 header,
-                text="☐ Pick",
+                text="☐",
                 command=lambda ridx=row_index, p=path: self._toggle_manual_winner(ridx, p),
                 bg="#404040",
                 fg="white",
@@ -551,7 +572,11 @@ class BurstDetectionTool:
                 "side": side,
             }
 
-            priority = (row_index * 1000) + idx + (0 if context == "main" else 100000)
+            priority = (
+                (row_index * _THUMBNAIL_PRIORITY_ROW_MULTIPLIER)
+                + idx
+                + (_THUMBNAIL_PRIORITY_REVIEW_OFFSET if context == "review" else 0)
+            )
             self._queue_thumbnail_request(image_label, path, side, priority)
 
         if context == "main":
@@ -658,6 +683,9 @@ class BurstDetectionTool:
         winner_names = ", ".join(Path(p).name for p in new_winners) or "none"
         self.app.log(f"Burst Detection: manual winner(s) for row {row_index + 1} -> {winner_names}")
 
+    def _row_to_index(self, row: dict) -> int:
+        return int(row.get("index", 1)) - 1
+
     def _set_row_winners(self, row_index: int, winner_paths: list[Path], source: str | None, vl_meta: dict | None = None):
         if not (0 <= row_index < len(self.rows)):
             return
@@ -716,7 +744,7 @@ class BurstDetectionTool:
         border = _LIME if is_selected else "#444444"
         button_bg = _LIME if is_selected else "#404040"
         button_fg = "#101010" if is_selected else "white"
-        button_text = "✓ Winner" if is_selected else "☐ Pick"
+        button_text = "✓" if is_selected else "☐"
 
         for widget_name in ("card", "header", "image_label", "name_label", "meta_label"):
             widget = card_info.get(widget_name)
@@ -765,8 +793,16 @@ class BurstDetectionTool:
             fg="white",
             font=("Arial", 12, "bold"),
         ).pack(side="left", padx=12, pady=10)
+        review_row_index = self._row_to_index(row)
+        review_vl_button = tk.Button(
+            header,
+            text="Run VL For Row",
+            command=lambda ridx=review_row_index: self.run_single_row_through_vl(ridx),
+        )
+        review_vl_button.pack(side="right", padx=(6, 6))
         status_label = tk.Label(header, text=row["status_var"].get(), bg="#171717", fg="#d7f6f8")
         status_label.pack(side="right", padx=12)
+        row["review_vl_button"] = review_vl_button
         row["review_status_label"] = status_label
 
         body = tk.Frame(window, bg="#101010")
@@ -792,6 +828,7 @@ class BurstDetectionTool:
             row["review_cards"] = {}
             row["review_inner"] = None
             row["review_window"] = None
+            row["review_vl_button"] = None
             row["review_status_label"] = None
             window.destroy()
 
@@ -992,6 +1029,7 @@ class BurstDetectionTool:
             row["review_window"] = None
             row["review_inner"] = None
             row["review_cards"] = {}
+            row["review_vl_button"] = None
             row["review_status_label"] = None
 
     def run_single_row_through_vl(self, row_index: int):
