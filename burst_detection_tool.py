@@ -7,8 +7,12 @@ from tkinter import filedialog
 
 from PIL import Image, ImageOps, ImageTk
 
-from burst_service import BurstAnalysis, analyze_bursts
+from burst_service import BurstAnalysis, group_adjacent_images, list_supported_images
 from lmstudio_client import LMStudioClient
+
+_RENDER_BATCH_SIZE = 5       # rows rendered per Tkinter event-loop cycle
+_RENDER_BATCH_DELAY_MS = 10  # ms between batches; keeps UI responsive during large renders
+_LOG_PROGRESS_EVERY = 25     # log a progress message every N rows rendered
 
 
 class BurstDetectionTool:
@@ -37,6 +41,10 @@ class BurstDetectionTool:
         self.row_thumbnail_refs: dict[int, list[ImageTk.PhotoImage]] = {}
         self._active = False
         self._vl_running = False
+        self._analysis_running = False
+        self._render_cancelled = False
+        self._render_gen = 0
+        self._analyze_btn: tk.Button | None = None
 
     def build_panel(self, parent):
         self.panel = tk.Frame(parent, bg="#2a2a2a")
@@ -57,7 +65,8 @@ class BurstDetectionTool:
         tk.Label(self.panel, text="# Keep Per Burst", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
         tk.Entry(self.panel, textvariable=self.keep_per_burst_var).pack(fill="x", **pad)
 
-        tk.Button(self.panel, text="Analyze Timestamps", command=self.analyze_timestamps).pack(fill="x", padx=10, pady=(8, 6))
+        self._analyze_btn = tk.Button(self.panel, text="Analyze Timestamps", command=self.analyze_timestamps)
+        self._analyze_btn.pack(fill="x", padx=10, pady=(8, 6))
 
         tk.Label(
             self.panel,
@@ -81,6 +90,7 @@ class BurstDetectionTool:
 
     def on_deactivate(self):
         self._active = False
+        self._render_cancelled = True
         self.app.ui.set_preview_widget(None)
 
     def apply_profile(self, profile):
@@ -116,7 +126,7 @@ class BurstDetectionTool:
             self.preview_canvas.bind("<MouseWheel>", self._on_preview_mousewheel)
 
         self.app.ui.set_preview_widget(self.preview_frame)
-        self._render_rows()
+        self._start_incremental_render()
 
     def _on_preview_rows_configure(self, event=None):
         if self.preview_canvas is not None:
@@ -149,6 +159,10 @@ class BurstDetectionTool:
             return 1
 
     def analyze_timestamps(self):
+        if self._analysis_running:
+            self.app.log("Burst Detection: analysis already running.")
+            return
+
         source_folder = Path(self.source_folder_var.get().strip())
         if not source_folder.exists() or not source_folder.is_dir():
             self.app.log("Burst Detection: choose a valid source folder.")
@@ -156,13 +170,50 @@ class BurstDetectionTool:
 
         fps_threshold = self._parse_fps_threshold()
         keep_per_burst = self._parse_keep_per_burst()
+
+        self._analysis_running = True
+        self._render_cancelled = True
+        if self._analyze_btn is not None:
+            self._analyze_btn.config(state="disabled")
+
         self.app.log(
-            f"Burst Detection: analyzing {source_folder} @ {fps_threshold:.2f} FPS (keep={keep_per_burst})."
+            f"Burst Detection: starting analysis of {source_folder} "
+            f"@ {fps_threshold:.2f} FPS (keep={keep_per_burst})."
         )
 
-        self.analysis = analyze_bursts(source_folder, fps_threshold)
+        def worker():
+            try:
+                ordered_paths = list_supported_images(source_folder)
+                n_images = len(ordered_paths)
+                self.app.root.after(
+                    0,
+                    lambda n=n_images: self.app.log(
+                        f"Burst Detection: loaded {n} total image(s) from the folder."
+                    ),
+                )
+                self.app.root.after(
+                    0, lambda: self.app.log("Burst Detection: analyzing burst groups...")
+                )
+                all_groups = group_adjacent_images(ordered_paths, fps_threshold)
+                burst_groups = [g for g in all_groups if len(g) > 1]
+                analysis = BurstAnalysis(
+                    ordered_paths=ordered_paths,
+                    all_groups=all_groups,
+                    burst_groups=burst_groups,
+                )
+                self.app.root.after(0, lambda a=analysis: self._on_analysis_complete(a))
+            except Exception as exc:
+                self.app.root.after(0, lambda e=exc: self._on_analysis_error(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_analysis_complete(self, analysis: BurstAnalysis):
+        self.analysis = analysis
+        n_groups = len(analysis.burst_groups)
+        self.app.log(f"Burst Detection: identified {n_groups} burst group(s).")
+
         self.rows = []
-        for index, group in enumerate(self.analysis.burst_groups, start=1):
+        for index, group in enumerate(analysis.burst_groups, start=1):
             self.rows.append(
                 {
                     "index": index,
@@ -173,14 +224,24 @@ class BurstDetectionTool:
                     "winner_source": None,
                     "row_frame": None,
                     "thumbs_frame": None,
+                    "expand_btn": None,
                 }
             )
 
-        self._ensure_preview_widget()
+        self._analysis_running = False
+        if self._analyze_btn is not None:
+            self._analyze_btn.config(state="normal")
+
+        # Allow the new render to proceed (was cancelled at analysis start).
+        self._render_cancelled = False
         self._refresh_summary()
-        self.app.log(
-            f"Burst Detection: complete. images={self.analysis.total_images}, burst_groups={len(self.analysis.burst_groups)}."
-        )
+        self._ensure_preview_widget()
+
+    def _on_analysis_error(self, exc: Exception):
+        self._analysis_running = False
+        if self._analyze_btn is not None:
+            self._analyze_btn.config(state="normal")
+        self.app.log(f"Burst Detection: analysis failed ({exc}).")
 
     def _refresh_summary(self):
         total_images = self.analysis.total_images if self.analysis else 0
@@ -197,13 +258,20 @@ class BurstDetectionTool:
             f"Selected rows: {selected_rows}"
         )
 
-    def _render_rows(self):
+    def _start_incremental_render(self):
         if self.preview_rows_frame is None:
             return
 
         for child in self.preview_rows_frame.winfo_children():
             child.destroy()
         self.row_thumbnail_refs = {}
+
+        for row in self.rows:
+            row["row_frame"] = None
+            row["thumbs_frame"] = None
+            row["expand_btn"] = None
+
+        self._render_cancelled = False
 
         if not self.rows:
             tk.Label(
@@ -216,55 +284,94 @@ class BurstDetectionTool:
             self._on_preview_rows_configure()
             return
 
-        for row in self.rows:
-            row_frame = tk.Frame(self.preview_rows_frame, bg="#1a1a1a", bd=1, relief="solid", highlightbackground="#303030")
-            row_frame.pack(fill="x", padx=6, pady=6)
-            row["row_frame"] = row_frame
+        self.app.log(f"Burst Detection: rendering preview for {len(self.rows)} burst group(s)...")
+        self._render_gen += 1
+        gen = self._render_gen
+        self.app.root.after(0, lambda g=gen: self._render_batch(0, g))
 
-            controls = tk.Frame(row_frame, bg="#1a1a1a")
-            controls.pack(fill="x", padx=6, pady=(6, 4))
+    def _render_batch(self, start_index: int, gen: int):
+        if self._render_cancelled or gen != self._render_gen:
+            return
+        if self.preview_rows_frame is None or not self.preview_rows_frame.winfo_exists():
+            return
 
-            tk.Checkbutton(
-                controls,
-                variable=row["selected_var"],
-                command=self._refresh_summary,
-                bg="#1a1a1a",
-                fg="white",
-                selectcolor="#404040",
-            ).pack(side="left")
-
-            tk.Label(
-                controls,
-                text=f"Burst Group {row['index']} ({len(row['paths'])} frame(s))",
-                bg="#1a1a1a",
-                fg="white",
-                font=("Arial", 10, "bold"),
-            ).pack(side="left", padx=(6, 12))
-
-            tk.Button(
-                controls,
-                text="Collapse" if row["expanded"] else "Expand",
-                command=lambda current_row=row: self._toggle_row_expand(current_row),
-            ).pack(side="right", padx=(6, 0))
-            tk.Button(
-                controls,
-                text="Send Row To VL",
-                command=lambda current_row=row: self.run_single_row_through_vl(current_row["index"] - 1),
-            ).pack(side="right")
-
-            thumbs_frame = tk.Frame(row_frame, bg="#181818")
-            thumbs_frame.pack(fill="x", padx=6, pady=(0, 6))
-            row["thumbs_frame"] = thumbs_frame
-
-            self._render_row_thumbnails(row)
+        end_index = min(start_index + _RENDER_BATCH_SIZE, len(self.rows))
+        for i in range(start_index, end_index):
+            self._render_single_row(self.rows[i])
 
         self._on_preview_rows_configure()
-        if self.preview_canvas is not None:
-            self.preview_canvas.yview_moveto(0)
+
+        if end_index < len(self.rows):
+            if end_index % _LOG_PROGRESS_EVERY == 0:
+                self.app.log(
+                    f"Burst Detection: rendered {end_index}/{len(self.rows)} rows..."
+                )
+            self.app.root.after(_RENDER_BATCH_DELAY_MS, lambda: self._render_batch(end_index, gen))
+        else:
+            self.app.log(
+                f"Burst Detection: preview complete ({len(self.rows)} row(s) rendered)."
+            )
+            if self.preview_canvas is not None:
+                self.preview_canvas.yview_moveto(0)
+
+    def _render_single_row(self, row: dict):
+        row_frame = tk.Frame(
+            self.preview_rows_frame,
+            bg="#1a1a1a",
+            bd=1,
+            relief="solid",
+            highlightbackground="#303030",
+        )
+        row_frame.pack(fill="x", padx=6, pady=6)
+        row["row_frame"] = row_frame
+
+        controls = tk.Frame(row_frame, bg="#1a1a1a")
+        controls.pack(fill="x", padx=6, pady=(6, 4))
+
+        tk.Checkbutton(
+            controls,
+            variable=row["selected_var"],
+            command=self._refresh_summary,
+            bg="#1a1a1a",
+            fg="white",
+            selectcolor="#404040",
+        ).pack(side="left")
+
+        tk.Label(
+            controls,
+            text=f"Burst Group {row['index']} ({len(row['paths'])} frame(s))",
+            bg="#1a1a1a",
+            fg="white",
+            font=("Arial", 10, "bold"),
+        ).pack(side="left", padx=(6, 12))
+
+        expand_btn = tk.Button(
+            controls,
+            text="Collapse" if row.get("expanded") else "Expand",
+            command=lambda current_row=row: self._toggle_row_expand(current_row),
+        )
+        expand_btn.pack(side="right", padx=(6, 0))
+        row["expand_btn"] = expand_btn
+
+        tk.Button(
+            controls,
+            text="Send Row To VL",
+            command=lambda current_row=row: self.run_single_row_through_vl(current_row["index"] - 1),
+        ).pack(side="right")
+
+        thumbs_frame = tk.Frame(row_frame, bg="#181818")
+        thumbs_frame.pack(fill="x", padx=6, pady=(0, 6))
+        row["thumbs_frame"] = thumbs_frame
+
+        self._render_row_thumbnails(row)
 
     def _toggle_row_expand(self, row: dict):
         row["expanded"] = not bool(row.get("expanded"))
-        self._render_rows()
+        expand_btn = row.get("expand_btn")
+        if expand_btn is not None:
+            expand_btn.config(text="Collapse" if row["expanded"] else "Expand")
+        self._render_row_thumbnails(row)
+        self._on_preview_rows_configure()
 
     def _render_row_thumbnails(self, row: dict):
         thumbs_frame = row.get("thumbs_frame")
