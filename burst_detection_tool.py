@@ -85,6 +85,7 @@ class BurstDetectionTool:
         self._thumbnail_queue: queue.PriorityQueue = queue.PriorityQueue()
         self._thumbnail_job_seq = 0
         self._thumbnail_epoch = 0
+        self._thumbnail_tokens: dict[str, tuple[int, int]] = {}
         self._thumbnail_worker = threading.Thread(target=self._thumbnail_worker_loop, daemon=True)
         self._thumbnail_worker.start()
 
@@ -135,8 +136,7 @@ class BurstDetectionTool:
 
     def on_activate(self):
         self._active = True
-        if not self.source_folder_var.get().strip() and self.app.state.input_folder:
-            self.source_folder_var.set(str(self.app.state.input_folder))
+        self._sync_source_folder_from_app()
         self._ensure_preview_widget()
         self._refresh_summary()
 
@@ -158,8 +158,7 @@ class BurstDetectionTool:
         self.fps_threshold_var.set(str(settings.fps_threshold))
         self.keep_per_burst_var.set(str(settings.keep_per_burst))
         self._set_winner_criteria_text(settings.winner_criteria)
-        if not self.source_folder_var.get().strip() and self.app.state.input_folder:
-            self.source_folder_var.set(str(self.app.state.input_folder))
+        self._sync_source_folder_from_app()
 
     def get_profile_data(self):
         self.save_burst_setup(log=False)
@@ -184,6 +183,10 @@ class BurstDetectionTool:
     def reload_burst_setup(self):
         self.apply_profile(self.app.get_current_profile())
         self.app.log(f"Burst Detection: loaded setup for profile '{self.app.get_selected_profile_name()}'.")
+
+    def _sync_source_folder_from_app(self):
+        if not self.source_folder_var.get().strip() and self.app.state.input_folder:
+            self.source_folder_var.set(str(self.app.state.input_folder))
 
     def _ensure_preview_widget(self):
         if self.preview_frame is None or not self.preview_frame.winfo_exists():
@@ -560,7 +563,8 @@ class BurstDetectionTool:
     def _queue_thumbnail_request(self, image_label: tk.Label, image_path: Path, side: int, priority: int):
         token = (self._thumbnail_epoch, self._thumbnail_job_seq + 1)
         self._thumbnail_job_seq += 1
-        image_label._burst_thumb_token = token
+        widget_key = str(image_label)
+        self._thumbnail_tokens[widget_key] = token
 
         cache_key = (self._path_key(image_path), int(side))
         with self._thumbnail_cache_lock:
@@ -578,6 +582,7 @@ class BurstDetectionTool:
                     "side": int(side),
                     "cache_key": cache_key,
                     "callback": lambda img, tok=token, lbl=image_label: self._apply_thumbnail_to_label(lbl, img, tok),
+                    "display_name": Path(image_path).name,
                 },
             )
         )
@@ -596,7 +601,10 @@ class BurstDetectionTool:
             if cached is None:
                 try:
                     image = build_square_thumbnail(path, side)
-                except Exception:
+                except Exception as exc:
+                    self._log_async(
+                        f"Burst Detection: thumbnail load failed for {job.get('display_name', path.name)} ({exc})."
+                    )
                     image = Image.new("RGB", (side, side), (38, 38, 38))
                 with self._thumbnail_cache_lock:
                     self._thumbnail_cache[cache_key] = image
@@ -613,7 +621,7 @@ class BurstDetectionTool:
                 return
         except Exception:
             return
-        if getattr(image_label, "_burst_thumb_token", None) != token:
+        if self._thumbnail_tokens.get(str(image_label)) != token:
             return
         photo = ImageTk.PhotoImage(pil_image)
         image_label.configure(image=photo, text="")
@@ -1355,7 +1363,10 @@ class BurstDetectionTool:
 
             draw.rounded_rectangle(panel_box, radius=16, fill=(38, 38, 38, 255), outline=(215, 215, 215, 255), width=4)
 
-            image = load_rgb_image(image_path)
+            try:
+                image = load_rgb_image(image_path)
+            except Exception as exc:
+                raise ValueError(f"Failed to load burst round image '{image_path.name}': {exc}") from exc
             max_content_w = panel_w - 28
             max_content_h = panel_h - 118
             image.thumbnail((max_content_w, max_content_h), Image.LANCZOS)
