@@ -4,6 +4,7 @@ from pathlib import Path
 import tkinter as tk
 
 from ai_crop_tool import AICropTool
+from burst_detection_tool import BurstDetectionTool
 from ai_cull_tool import AICullTool
 from cached_crop_tool import CachedCropTool
 from lmstudio_tool import LMStudioTool
@@ -49,6 +50,7 @@ class SportsToolkitApp:
 
     def _register_tools(self):
         ai_crop_tool = AICropTool(self)
+        burst_detection_tool = BurstDetectionTool(self)
         manual_tool = ManualCropTool(self)
         ai_cull_tool = AICullTool(self)
         cached_crop_tool = CachedCropTool(self)
@@ -57,6 +59,7 @@ class SportsToolkitApp:
 
         for tool in [
             ai_crop_tool,
+            burst_detection_tool,
             manual_tool,
             ai_cull_tool,
             cached_crop_tool,
@@ -296,9 +299,14 @@ class SportsToolkitApp:
         )
 
     def set_active_tool(self, tool_id: str):
+        previous_tool = self.tools.get(self.state.active_tool_id)
+        if previous_tool is not None and hasattr(previous_tool, "on_deactivate"):
+            previous_tool.on_deactivate()
+
         self.state.active_tool_id = tool_id
         tool = self.tools[tool_id]
 
+        self.ui.set_preview_widget(None)
         self.ui.set_tool_panel(tool.build_panel)
         self.ui.set_active_tool_label(tool.display_name)
 
@@ -308,6 +316,8 @@ class SportsToolkitApp:
 
         if self.current_image is not None and hasattr(tool, "on_image_changed"):
             tool.on_image_changed()
+        if hasattr(tool, "on_activate"):
+            tool.on_activate()
 
         self.log(f"Active tool: {tool.display_name}")
 
