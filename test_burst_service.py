@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from burst_service import (
+    DEFAULT_BURST_THUMBNAIL_SIZE,
     BurstSettingsStore,
     BurstToolSettings,
     DEFAULT_BURST_WINNER_CRITERIA,
@@ -24,13 +25,15 @@ class BurstServiceTests(unittest.TestCase):
             store = BurstSettingsStore(Path(tmpdir) / "burst_settings.json")
             store.save_profile(
                 "Dance",
-                BurstToolSettings(fps_threshold=12.5, keep_per_burst=3, winner_criteria="peak action"),
+                BurstToolSettings(fps_threshold=12.5, keep_per_burst=3, winner_criteria="peak action", thumbnail_size=320),
             )
             loaded = store.load_profile("Dance")
             self.assertEqual(12.5, loaded.fps_threshold)
             self.assertEqual(3, loaded.keep_per_burst)
             self.assertEqual("peak action", loaded.winner_criteria)
+            self.assertEqual(320, loaded.thumbnail_size)
             self.assertEqual(default_winner_criteria_text(), store.load_profile("Unknown").winner_criteria)
+            self.assertEqual(DEFAULT_BURST_THUMBNAIL_SIZE, store.load_profile("Unknown").thumbnail_size)
 
 
 if __name__ == "__main__":
