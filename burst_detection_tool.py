@@ -30,9 +30,9 @@ _RENDER_BATCH_DELAY_MS = 10
 _LOG_PROGRESS_EVERY = 25
 _THUMBNAIL_BATCH_SIZE = 10
 _THUMBNAIL_BATCH_SLEEP_SEC = 0.03
-_MAIN_THUMB_SIDE = 192
-_REVIEW_THUMB_SIDE = 440
-_MAIN_THUMB_CANVAS_EXTRA_HEIGHT = 92
+_MAIN_THUMB_SIDE = 576
+_REVIEW_THUMB_SIDE = 576
+_MAIN_THUMB_CANVAS_EXTRA_HEIGHT = 120
 _THUMBNAIL_PRIORITY_ROW_MULTIPLIER = 1000
 _THUMBNAIL_PRIORITY_REVIEW_OFFSET = -100000
 _PREVIEW_SCREEN_FRACTION = 0.92
@@ -538,15 +538,15 @@ class BurstDetectionTool:
             )
             winner_button.pack(side="right")
 
+            placeholder_pil = Image.new("RGB", (side, side), (38, 38, 38))
+            placeholder_photo = ImageTk.PhotoImage(placeholder_pil)
             image_label = tk.Label(
                 card,
-                text="Loading...",
-                width=max(10, side // 9),
-                height=max(4, side // 20),
+                image=placeholder_photo,
                 bg="#202020",
-                fg="#cde8ff",
                 cursor="hand2",
             )
+            image_label.image = placeholder_photo
             image_label.pack(padx=4, pady=(2, 2))
             image_label.bind("<Button-1>", lambda _event, ridx=row_index, p=path: self._open_image_preview(ridx, p))
 
