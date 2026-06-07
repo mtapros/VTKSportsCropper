@@ -20,6 +20,7 @@ class MainWindow:
         self.current_pil = None
         self.current_tk = None
         self.current_scale = 1.0
+        self.custom_preview_widget = None
         self.overlay_boxes = []
         self.manual_boxes = []
         self.manual_selected_ids = set()
@@ -184,7 +185,10 @@ class MainWindow:
         self.dynamic_panel.pack(fill="both", expand=True, padx=0, pady=(0, 12))
 
     def _build_center(self):
-        self.canvas = tk.Canvas(self.center, bg="black", highlightthickness=0, cursor="cross")
+        self.preview_host = tk.Frame(self.center, bg="#1f1f1f")
+        self.preview_host.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 6))
+
+        self.canvas = tk.Canvas(self.preview_host, bg="black", highlightthickness=0, cursor="cross")
         self.canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 6))
         self.canvas.bind("<Configure>", lambda e: self.redraw_canvas())
         self.canvas.bind("<Button-1>", self._on_canvas_click)
@@ -284,6 +288,7 @@ class MainWindow:
             "AI Crop Tool": "Automated subject-driven crop recommendations",
             "Manual Crop Tool": "Manual subject selection and crop building",
             "AI Cull Tool": "AI-assisted image culling, ranking, and filtering",
+            "Burst Detection Tool": "Standalone timestamp burst analysis and VL winner selection",
             "Cached Crop Tool": "Cache-driven crop preview with nested ratio guides and batch commit",
             "Full Trial Pipeline": "Automated cull-to-crop batch run with live visual progress",
             "LM Studio Test": "LM Studio local model test and vision prompt debugging",
@@ -293,6 +298,7 @@ class MainWindow:
             "AI Crop Tool": ("#1d3557", "#dbe7f5"),
             "Manual Crop Tool": ("#6a3f00", "#ffe7c2"),
             "AI Cull Tool": ("#3f2a56", "#eadbff"),
+            "Burst Detection Tool": ("#234e52", "#d7f6f8"),
             "Cached Crop Tool": ("#5a3a1a", "#ffe8cf"),
             "Full Trial Pipeline": ("#1f5c42", "#d8ffef"),
             "LM Studio Test": ("#3f2a56", "#eadbff"),
@@ -354,6 +360,29 @@ class MainWindow:
         self.debug_views = []
         self.debug_tk_images = []
         self.canvas.delete("all")
+
+    def set_preview_widget(self, widget):
+        if (
+            widget is not None
+            and self.custom_preview_widget is widget
+            and self.custom_preview_widget.winfo_exists()
+        ):
+            return
+
+        if self.custom_preview_widget is not None and self.custom_preview_widget.winfo_exists():
+            self.custom_preview_widget.destroy()
+        self.custom_preview_widget = None
+
+        if widget is None:
+            if not self.canvas.winfo_manager():
+                self.canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 6))
+            self.redraw_canvas()
+            return
+
+        if self.canvas.winfo_manager():
+            self.canvas.pack_forget()
+        self.custom_preview_widget = widget
+        self.custom_preview_widget.pack(fill=tk.BOTH, expand=True)
 
     def show_image(self, pil_image):
         self.current_pil = pil_image
