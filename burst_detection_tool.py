@@ -30,8 +30,8 @@ _RENDER_BATCH_DELAY_MS = 10
 _LOG_PROGRESS_EVERY = 25
 _THUMBNAIL_BATCH_SIZE = 10
 _THUMBNAIL_BATCH_SLEEP_SEC = 0.03
-_MAIN_THUMB_SIDE = 96
-_REVIEW_THUMB_SIDE = 220
+_MAIN_THUMB_SIDE = 192
+_REVIEW_THUMB_SIDE = 440
 _PREVIEW_SCREEN_FRACTION = 0.92
 _LIME = "#7CFF4D"
 _LIME_RGB = (124, 255, 77)
@@ -474,9 +474,22 @@ class BurstDetectionTool:
         )
         status.pack(fill="x", padx=10, pady=(0, 4))
 
-        thumbs_frame = tk.Frame(row_frame, bg="#181818")
-        thumbs_frame.pack(fill="x", padx=6, pady=(0, 6))
+        thumbs_host = tk.Frame(row_frame, bg="#181818")
+        thumbs_host.pack(fill="x", padx=6, pady=(0, 6))
+        thumbs_canvas = tk.Canvas(thumbs_host, bg="#181818", highlightthickness=0, height=_MAIN_THUMB_SIDE + 92)
+        thumbs_scroll = tk.Scrollbar(thumbs_host, orient="horizontal", command=thumbs_canvas.xview)
+        thumbs_canvas.configure(xscrollcommand=thumbs_scroll.set)
+        thumbs_canvas.pack(fill="x", expand=True)
+        thumbs_scroll.pack(fill="x")
+
+        thumbs_frame = tk.Frame(thumbs_canvas, bg="#181818")
+        thumbs_window = thumbs_canvas.create_window((0, 0), window=thumbs_frame, anchor="nw")
+        thumbs_frame.bind("<Configure>", lambda _event, c=thumbs_canvas: c.configure(scrollregion=c.bbox("all")))
+        thumbs_canvas.bind("<Configure>", lambda event, c=thumbs_canvas, w=thumbs_window: c.itemconfigure(w, height=event.height))
+
         row["thumbs_frame"] = thumbs_frame
+        row["thumbs_canvas"] = thumbs_canvas
+        row["thumbs_scroll"] = thumbs_scroll
 
         self._render_row_cards(row, thumbs_frame, _MAIN_THUMB_SIDE, context="main")
         self._update_row_status(row)
@@ -488,7 +501,7 @@ class BurstDetectionTool:
         cards: dict[str, dict] = {}
         total = len(row["paths"])
         row_index = row["index"] - 1
-        columns = 1 if context == "main" else 4
+        columns = 2 if context == "review" else 1
 
         for idx, image_path in enumerate(row["paths"], start=1):
             path = Path(image_path)
@@ -496,7 +509,7 @@ class BurstDetectionTool:
 
             card = tk.Frame(host, bg="#202020", bd=2, relief="solid", highlightbackground="#444444", highlightthickness=2)
             if context == "main":
-                card.pack(side="left", padx=4, pady=4)
+                card.pack(side="left", padx=8, pady=6)
             else:
                 grid_row = (idx - 1) // columns
                 grid_col = (idx - 1) % columns
@@ -506,7 +519,7 @@ class BurstDetectionTool:
             header.pack(fill="x", padx=4, pady=(4, 2))
             winner_button = tk.Button(
                 header,
-                text="☐ Pick",
+                text="☐",
                 command=lambda ridx=row_index, p=path: self._toggle_manual_winner(ridx, p),
                 bg="#404040",
                 fg="white",
@@ -551,7 +564,7 @@ class BurstDetectionTool:
                 "side": side,
             }
 
-            priority = (row_index * 1000) + idx + (0 if context == "main" else 100000)
+            priority = (row_index * 1000) + idx + (-100000 if context == "review" else 0)
             self._queue_thumbnail_request(image_label, path, side, priority)
 
         if context == "main":
@@ -716,7 +729,7 @@ class BurstDetectionTool:
         border = _LIME if is_selected else "#444444"
         button_bg = _LIME if is_selected else "#404040"
         button_fg = "#101010" if is_selected else "white"
-        button_text = "✓ Winner" if is_selected else "☐ Pick"
+        button_text = "✓" if is_selected else "☐"
 
         for widget_name in ("card", "header", "image_label", "name_label", "meta_label"):
             widget = card_info.get(widget_name)
@@ -765,6 +778,11 @@ class BurstDetectionTool:
             fg="white",
             font=("Arial", 12, "bold"),
         ).pack(side="left", padx=12, pady=10)
+        tk.Button(
+            header,
+            text="Run VL For Row",
+            command=lambda ridx=row["index"] - 1: self.run_single_row_through_vl(ridx),
+        ).pack(side="right", padx=(6, 6))
         status_label = tk.Label(header, text=row["status_var"].get(), bg="#171717", fg="#d7f6f8")
         status_label.pack(side="right", padx=12)
         row["review_status_label"] = status_label
