@@ -1231,6 +1231,8 @@ class AICullTool:
         except Exception:
             model = ""
             provider = ""
+        # LM Studio is excluded from the tag so existing caches created before
+        # multi-provider support remain valid for local users.
         provider_tag = "" if provider in ("", "lmstudio") else f"{provider}|"
         raw = f"{DANCE_CULL_SCHEMA_VERSION}|{provider_tag}{model}|vl1024|bigbadges|fullbatchflow"
         return hashlib.md5(raw.encode()).hexdigest()[:12]
@@ -3964,6 +3966,8 @@ class AICullTool:
                 self._worker_queue.put(("done", total, False, total))
             finally:
                 if prefetch_executor is not None:
+                    # In-flight HTTP requests cannot be interrupted; cancel pending
+                    # futures and return without blocking the UI on stragglers.
                     prefetch_executor.shutdown(wait=False, cancel_futures=True)
 
         self._worker_thread = threading.Thread(target=worker, daemon=True)

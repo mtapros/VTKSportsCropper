@@ -226,6 +226,7 @@ class GeminiClient(LMStudioClient):
         data = self._http_post_json(f"/models/{model_id}:generateContent", payload)
 
         text_parts: list[str] = []
+        # Only the first candidate is used; the app always requests a single answer.
         for candidate in data.get("candidates", []) or []:
             for part in (candidate.get("content", {}) or {}).get("parts", []) or []:
                 if isinstance(part, dict) and part.get("text"):
