@@ -3353,16 +3353,20 @@ class AICullTool:
                 break
             opp_shuffled = list(opponents)
             rng.shuffle(opp_shuffled)
-            winner, meta, round_index = self._select_single_burst_winner_via_tournament(
-                client=client,
-                model=model,
-                items=[winner] + opponents,
-                start_round=round_index,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                criteria=criteria,
-                group_seed=group_seed,
-            ) if len([winner] + opponents) > 1 else (winner, {}, round_index)
+            combined = [winner] + opponents
+            if len(combined) > 1:
+                winner, meta, round_index = self._select_single_burst_winner_via_tournament(
+                    client=client,
+                    model=model,
+                    items=combined,
+                    start_round=round_index,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    criteria=criteria,
+                    group_seed=group_seed,
+                )
+            else:
+                meta = {}
             if isinstance(meta, dict):
                 round_meta.append(meta)
             elif isinstance(meta, list):
@@ -3496,8 +3500,8 @@ class AICullTool:
                     still_needed = keep_target - len(chosen)
                     if len(non_dup) >= still_needed:
                         remaining = non_dup
-                        if excluded_as_dup:
-                            rounds[-1:] and rounds[-1].update({"excluded_as_duplicates": excluded_as_dup})
+                        if excluded_as_dup and rounds:
+                            rounds[-1].update({"excluded_as_duplicates": excluded_as_dup})
 
         except Exception as exc:
             self.app.log(f"AI Cull: VL burst tie-breaker unavailable ({exc}); using heuristic ranking.")

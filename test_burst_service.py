@@ -275,7 +275,6 @@ class DHashTests(unittest.TestCase):
     def test_similar_images_low_distance(self):
         # Two very similar images (same gradient, slight brightness tweak)
         base = _gradient_image((128, 64))
-        import copy
         from PIL import ImageEnhance
         tweaked = ImageEnhance.Brightness(base).enhance(1.05)
         h_base = dhash(base)
@@ -297,7 +296,8 @@ class PilLaplacianFocusTests(unittest.TestCase):
 
     def test_sharp_greater_than_blurry(self):
         sharp = _gradient_image((256, 256))
-        blurry = sharp.filter(Image.filter.GaussianBlur(radius=20) if hasattr(Image, "filter") else __import__("PIL.ImageFilter", fromlist=["GaussianBlur"]).GaussianBlur(20))
+        from PIL import ImageFilter
+        blurry = sharp.filter(ImageFilter.GaussianBlur(20))
         f_sharp = pil_laplacian_focus(sharp)
         f_blurry = pil_laplacian_focus(blurry)
         self.assertGreater(f_sharp, f_blurry)
