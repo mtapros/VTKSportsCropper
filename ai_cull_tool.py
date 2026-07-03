@@ -5,6 +5,7 @@ import inspect
 import json
 import math
 import queue
+import random
 import shutil
 import threading
 from datetime import datetime, timezone
@@ -14,6 +15,17 @@ from tkinter import filedialog, ttk
 
 from PIL import Image, ImageOps, ExifTags, ImageDraw, ImageFont
 
+from burst_service import (
+    dhash as _burst_dhash,
+    hamming_distance as _burst_hamming,
+    pil_laplacian_focus as _burst_focus,
+    normalize_winner_criteria_lines,
+    DHASH_SCENE_CHANGE_THRESHOLD,
+    DHASH_NEAR_DUPLICATE_THRESHOLD,
+    DHASH_GAP_MERGE_THRESHOLD,
+    MAX_BURST_GROUP_FRAMES as _BS_MAX_FRAMES,
+    MAX_BURST_GROUP_SPAN_SEC as _BS_MAX_SPAN,
+)
 from core import (
     build_crop_around_subject,
     compute_iou,
@@ -25,7 +37,7 @@ from lmstudio_client import LMStudioClient
 from models import CropBox, Detection, SportProfile, BoundingBox
 
 
-DANCE_CULL_SCHEMA_VERSION = "dance_v2"
+DANCE_CULL_SCHEMA_VERSION = "dance_v3"
 SCENE_TYPE_VALUES = {"intro_pose", "finale_pose", "group_static_pose", "action", "unknown"}
 MIN_STATIC_GROUP_BURST_KEEP = 2
 
@@ -105,6 +117,9 @@ class AICullTool:
     VL_BURST_MAX_TEMPERATURE = 0.2
     VL_BURST_MIN_TOKENS = 256
     VL_BURST_MAX_TOKENS = 450
+    VL_BURST_LOW_CONFIDENCE = 0.6        # below this → low-confidence winner
+    MAX_BURST_GROUP_FRAMES = 20          # hard cap on frames per burst group
+    MAX_BURST_GROUP_SPAN_SEC = 5.0       # hard cap on time span per burst group
     MAX_BURST_THUMBNAILS = 6
 
     def __init__(self, app):
@@ -1756,6 +1771,8 @@ class AICullTool:
         score += {"strong": 10, "good": 6, "average": 0, "weak": -8}.get(str(rubric.get("composition_quality", "")).strip().lower(), 0)
         score += {"low": 4, "moderate": 0, "high": -8}.get(str(rubric.get("background_distraction", "")).strip().lower(), 0)
         score += {"good": 8, "somewhat_clear": 3, "poor": -8}.get(str(rubric.get("subject_separation", "")).strip().lower(), 0)
+        # Eyes open/closed signal (backward-compatible: default 0 when key is absent)
+        score += {"yes": 6, "partial": 0, "no": -12, "unknown": 0}.get(str(rubric.get("eyes_open", "unknown")).strip().lower(), 0)
 
         sharpness = str(rubric.get("sharpness", "")).strip().lower()
         subject_visibility = str(rubric.get("subject_visibility", "")).strip().lower()
@@ -2568,6 +2585,10 @@ class AICullTool:
             self.app.current_af_boxes = previous_af
 
     def _extract_capture_timestamp(self, image_path: Path) -> tuple[float, str]:
+        """Return (unix_timestamp, precision_source).
+
+        precision_source: "exif_subsec" | "exif_whole" | "mtime" | "none"
+        """
         try:
             with Image.open(image_path) as img:
                 exif = img.getexif()
@@ -2577,12 +2598,15 @@ class AICullTool:
                     base = str(dt_value).strip()
                     dt = datetime.strptime(base, "%Y:%m:%d %H:%M:%S")
                     frac = 0.0
-                    subsec = exif.get(37521)
+                    # Prefer SubSecTimeOriginal (37522), then SubSecTimeDigitized (37523),
+                    # then SubSecTime (37521) as last resort.
+                    subsec = exif.get(37522) or exif.get(37523) or exif.get(37521)
                     if subsec is not None:
                         digits = "".join(ch for ch in str(subsec) if ch.isdigit())
                         if digits:
                             frac = float(f"0.{digits}")
-                    return dt.timestamp() + frac, "exif"
+                            return dt.timestamp() + frac, "exif_subsec"
+                    return dt.timestamp(), "exif_whole"
         except Exception:
             pass
 
@@ -2596,11 +2620,24 @@ class AICullTool:
             return []
 
         threshold_sec = 1.0 / max(0.1, float(burst_fps))
-        bursts: list[list[Path]] = []
+        raw_groups: list[list[Path]] = []   # groups before span-cap pass
         current: list[Path] = []
         prev_ts: float | None = None
         prev_source: str | None = None
         prev_path: Path | None = None
+        hash_cache: dict[str, int] = {}     # path str → dHash
+
+        def _get_hash(path: Path) -> int | None:
+            key = str(path)
+            if key in hash_cache:
+                return hash_cache[key]
+            try:
+                img = self._load_rgb_image(path)
+                h = _burst_dhash(img)
+                hash_cache[key] = h
+                return h
+            except Exception:
+                return None
 
         for path in ordered_paths:
             ts, source = self._extract_capture_timestamp(Path(path))
@@ -2613,17 +2650,46 @@ class AICullTool:
 
             delta = ts - float(prev_ts or 0.0)
             same_burst = False
+
             if delta >= 0:
                 if source == "mtime" and prev_source == "mtime" and delta == 0:
-                    # Avoid grouping unrelated files with identical mtime when EXIF is unavailable.
+                    same_burst = self._looks_like_sequential_burst_names(prev_path, Path(path))
+                elif source == "exif_whole" and prev_source == "exif_whole" and 0 <= delta <= 1.0:
+                    # 1-second boundary gap with whole-second EXIF — corroborate with filenames.
                     same_burst = self._looks_like_sequential_burst_names(prev_path, Path(path))
                 else:
                     same_burst = delta <= threshold_sec
 
+                    # Attempt to merge across a small gap (up to 2× threshold) when
+                    # frames are visually very similar and filenames are sequential.
+                    if not same_burst and delta <= threshold_sec * 2:
+                        h_prev = _get_hash(prev_path)
+                        h_curr = _get_hash(Path(path))
+                        if (
+                            h_prev is not None
+                            and h_curr is not None
+                            and _burst_hamming(h_prev, h_curr) <= DHASH_GAP_MERGE_THRESHOLD
+                            and self._looks_like_sequential_burst_names(prev_path, Path(path))
+                        ):
+                            same_burst = True
+
+            if same_burst:
+                # Scene-change guard: split even when timestamps are close.
+                if len(current) >= 1:
+                    h_prev = _get_hash(prev_path)
+                    h_curr = _get_hash(Path(path))
+                    if (
+                        h_prev is not None
+                        and h_curr is not None
+                        and _burst_hamming(h_prev, h_curr) > DHASH_SCENE_CHANGE_THRESHOLD
+                    ):
+                        # Visual scene change detected — force a split.
+                        same_burst = False
+
             if same_burst:
                 current.append(Path(path))
             else:
-                bursts.append(current)
+                raw_groups.append(current)
                 current = [Path(path)]
 
             prev_ts = ts
@@ -2631,9 +2697,65 @@ class AICullTool:
             prev_path = Path(path)
 
         if current:
-            bursts.append(current)
+            raw_groups.append(current)
+
+        # --- Pass 2: enforce span caps ---
+        # Split any group that has grown too large or spans too long in time.
+        bursts: list[list[Path]] = []
+        for group in raw_groups:
+            bursts.extend(self._split_oversized_burst(group, hash_cache))
 
         return bursts
+
+    def _split_oversized_burst(
+        self,
+        group: list[Path],
+        hash_cache: dict[str, int],
+    ) -> list[list[Path]]:
+        """Split *group* whenever it exceeds MAX_BURST_GROUP_FRAMES or MAX_BURST_GROUP_SPAN_SEC.
+
+        Prefer to split at the largest dHash discontinuity within the group.
+        Returns a list of (possibly smaller) groups.
+        """
+        max_frames = self.MAX_BURST_GROUP_FRAMES
+        max_span = self.MAX_BURST_GROUP_SPAN_SEC
+
+        def _ts(p: Path) -> float:
+            t, _ = self._extract_capture_timestamp(p)
+            return t
+
+        def _needs_split(g: list[Path]) -> bool:
+            if len(g) > max_frames:
+                return True
+            if len(g) >= 2:
+                span = abs(_ts(g[-1]) - _ts(g[0]))
+                if span > max_span:
+                    return True
+            return False
+
+        if not _needs_split(group):
+            return [group]
+
+        # Find the split point with the highest dHash discontinuity (between consecutive frames).
+        best_split = len(group) // 2  # default: middle
+        best_dist = -1
+        for i in range(1, len(group)):
+            h_a = hash_cache.get(str(group[i - 1]))
+            h_b = hash_cache.get(str(group[i]))
+            if h_a is not None and h_b is not None:
+                d = _burst_hamming(h_a, h_b)
+                if d > best_dist:
+                    best_dist = d
+                    best_split = i
+
+        left = group[:best_split]
+        right = group[best_split:]
+        result: list[list[Path]] = []
+        if left:
+            result.extend(self._split_oversized_burst(left, hash_cache))
+        if right:
+            result.extend(self._split_oversized_burst(right, hash_cache))
+        return result
 
     def _looks_like_sequential_burst_names(self, previous_path: Path | None, current_path: Path) -> bool:
         if previous_path is None:
@@ -2669,20 +2791,71 @@ class AICullTool:
         return 0 < delta <= 3
 
     def _rank_burst_candidates(self, burst_results: list[dict]) -> list[dict]:
-        def key(item: dict) -> tuple[float, float, float, float, float]:
+        # Compute relative focus: normalize hero_focus against group max so
+        # within-burst comparison is more discriminating than absolute 0-120 scale.
+        max_hero_focus = max((float(item.get("hero_focus", 0.0)) for item in burst_results), default=1.0)
+        if max_hero_focus <= 0:
+            max_hero_focus = 1.0
+
+        def key(item: dict) -> tuple[float, float, float, float, float, float]:
             decision = str(item.get("decision", "Reject"))
             score = float(item.get("score", 0.0))
             hero_focus = float(item.get("hero_focus", 0.0))
+            rel_focus = hero_focus / max_hero_focus  # 0.0–1.0 relative within burst
             has_face = 1.0 if item.get("has_face", False) else 0.0
             face_focus = float(item.get("face_focus", 0.0))
-            return (float(self._decision_rank(decision)), score, hero_focus, has_face, face_focus)
+            return (float(self._decision_rank(decision)), score, rel_focus, hero_focus, has_face, face_focus)
 
         return sorted(burst_results, key=key, reverse=True)
 
     def _burst_vl_candidates(self, burst_results: list[dict], keep_per_burst: int) -> list[dict]:
+        """Return candidates for VL tournament, applying blur pre-filter and cap.
+
+        1. Compute a PIL-based focus score per candidate (stored as ``burst_focus``
+           in each item dict for reuse).
+        2. Auto-exclude obviously blurry frames (below 30 % of group best) while
+           always keeping at least ``keep_per_burst + 1`` candidates.
+        3. Cap to the top ``MAX_VL_BURST_CANDIDATES`` by focus.
+        """
         if len(burst_results) <= max(1, keep_per_burst):
             return []
-        return list(burst_results)
+
+        candidates = list(burst_results)
+        keep_min = max(2, keep_per_burst + 1)  # must pass at least this many to VL
+
+        # Compute focus scores for each candidate (cache in item dict).
+        for item in candidates:
+            if "burst_focus" not in item:
+                try:
+                    img = self._load_rgb_image(Path(item["path"]))
+                    # Use hero bbox when available for a tighter focus estimate.
+                    hero_bbox: tuple | None = None
+                    hero = item.get("hero_detection") or item.get("hero")
+                    if isinstance(hero, dict) and "bbox" in hero:
+                        b = hero["bbox"]
+                        hero_bbox = (b[0], b[1], b[2], b[3])
+                    elif hasattr(hero, "bbox"):
+                        bb = hero.bbox
+                        hero_bbox = (bb.x1, bb.y1, bb.x2, bb.y2)
+                    item["burst_focus"] = _burst_focus(img, hero_bbox)
+                except Exception:
+                    item["burst_focus"] = 0.0
+
+        best_focus = max((float(item.get("burst_focus", 0.0)) for item in candidates), default=0.0)
+        blur_threshold = best_focus * 0.30
+
+        # Exclude obviously blurry frames but never drop below keep_min.
+        if best_focus > 0 and len(candidates) > keep_min:
+            non_blurry = [item for item in candidates if float(item.get("burst_focus", 0.0)) >= blur_threshold]
+            if len(non_blurry) >= keep_min:
+                candidates = non_blurry
+
+        # Cap at MAX_VL_BURST_CANDIDATES by descending focus.
+        if len(candidates) > self.MAX_VL_BURST_CANDIDATES:
+            candidates = sorted(candidates, key=lambda x: float(x.get("burst_focus", 0.0)), reverse=True)
+            candidates = candidates[: self.MAX_VL_BURST_CANDIDATES]
+
+        return candidates
 
     def _resolve_vl_frame_choice(self, value: str, candidates: list[dict]) -> dict | None:
         candidate_by_name: dict[str, dict] = {}
@@ -2835,6 +3008,9 @@ class AICullTool:
         panel_w = 560
         panel_h = 480
         gap = 18
+        inset_w = 120   # full-frame / overview inset
+        inset_h = 90
+        inset_margin = 6
         cols, rows = self._burst_round_layout(len(round_items))
         canvas_w = cols * panel_w + (cols + 1) * gap
         canvas_h = rows * panel_h + (rows + 1) * gap
@@ -2858,13 +3034,78 @@ class AICullTool:
 
             draw.rounded_rectangle(panel_box, radius=16, fill=(38, 38, 38, 255), outline=(215, 215, 215, 255), width=4)
 
-            image = self._load_rgb_image(image_path)
+            full_image = self._load_rgb_image(image_path)
             max_content_w = panel_w - 28
             max_content_h = panel_h - 118
-            image.thumbnail((max_content_w, max_content_h), Image.LANCZOS)
-            ix = px + (panel_w - image.width) // 2
-            iy = py + 76 + (max_content_h - image.height) // 2
-            canvas.paste(image, (ix, iy))
+
+            # Determine if we have a valid hero bbox to crop to.
+            hero_bbox: tuple[int, int, int, int] | None = None
+            hero = item.get("hero_detection") or item.get("hero")
+            if isinstance(hero, dict) and "bbox" in hero:
+                b = hero["bbox"]
+                hero_bbox = (int(b[0]), int(b[1]), int(b[2]), int(b[3]))
+            elif hasattr(hero, "bbox"):
+                bb = hero.bbox
+                hero_bbox = (int(bb.x1), int(bb.y1), int(bb.x2), int(bb.y2))
+
+            panel_mode = "full"
+            inset_thumb: Image.Image | None = None
+
+            if hero_bbox is not None:
+                # --- Subject-crop mode ---
+                iw, ih = full_image.size
+                x1, y1, x2, y2 = hero_bbox
+                bw = x2 - x1
+                bh = y2 - y1
+                # Expand by 40 % margin on each side.
+                margin_x = int(bw * 0.40)
+                margin_y = int(bh * 0.40)
+                cx1 = max(0, x1 - margin_x)
+                cy1 = max(0, y1 - margin_y)
+                cx2 = min(iw, x2 + margin_x)
+                cy2 = min(ih, y2 + margin_y)
+                if cx2 > cx1 and cy2 > cy1:
+                    display_image = full_image.crop((cx1, cy1, cx2, cy2))
+                    panel_mode = "subject_crop"
+                    # Small full-frame inset for context.
+                    inset_thumb = full_image.copy()
+                    inset_thumb.thumbnail((inset_w, inset_h), Image.LANCZOS)
+                else:
+                    display_image = full_image
+            else:
+                # --- Center-crop inset mode (no detection data) ---
+                iw, ih = full_image.size
+                # 2× zoomed centre region
+                zoom_w = iw // 2
+                zoom_h = ih // 2
+                cx1_z = max(0, (iw - zoom_w) // 2)
+                cy1_z = max(0, (ih - zoom_h) // 2)
+                cx2_z = min(iw, cx1_z + zoom_w)
+                cy2_z = min(ih, cy1_z + zoom_h)
+                if cx2_z > cx1_z and cy2_z > cy1_z:
+                    display_image = full_image.crop((cx1_z, cy1_z, cx2_z, cy2_z))
+                    panel_mode = "center_zoom"
+                    # Small full-frame inset for context.
+                    inset_thumb = full_image.copy()
+                    inset_thumb.thumbnail((inset_w, inset_h), Image.LANCZOS)
+                else:
+                    display_image = full_image
+
+            item["_panel_mode"] = panel_mode
+
+            display_image = display_image.copy()
+            display_image.thumbnail((max_content_w, max_content_h), Image.LANCZOS)
+            ix = px + (panel_w - display_image.width) // 2
+            iy = py + 76 + (max_content_h - display_image.height) // 2
+            canvas.paste(display_image, (ix, iy))
+
+            # Paste inset thumbnail in bottom-right corner of panel.
+            if inset_thumb is not None:
+                inset_x = px + panel_w - inset_thumb.width - inset_margin
+                inset_y = py + panel_h - inset_thumb.height - inset_margin - 60  # above filename badge
+                inset_x = max(px + 4, inset_x)
+                inset_y = max(py + 76, inset_y)
+                canvas.paste(inset_thumb, (inset_x, inset_y))
 
             self._draw_badge(
                 draw,
@@ -2904,6 +3145,7 @@ class AICullTool:
         round_index: int,
         temperature: float,
         max_tokens: int,
+        criteria: list[str] | None = None,
     ) -> tuple[dict | None, dict]:
         grid_path, label_to_item = self._build_burst_round_grid(round_items, round_index)
         option_lines = "\n".join(
@@ -2911,19 +3153,43 @@ class AICullTool:
             for label, item in label_to_item.items()
         )
 
-        system_prompt = (
-            "You are a sports burst-frame comparison assistant.\n"
-            "You will see one labeled comparison grid image with panels named Panel A, Panel B, Panel C, or Panel D.\n"
-            "Choose the single best deliverable frame based on sharpness, subject clarity, and strongest timing.\n"
-            "Do not use object detection metadata; judge only the visual frame quality.\n"
-            "Return EXACTLY one valid JSON object and nothing else.\n"
-            "Required JSON keys:\n"
-            "- winner_label (string, one of A/B/C/D that is present)\n"
-            "- runner_up_labels (array of zero or more labels from A/B/C/D that are present)\n"
-            "- confidence (number 0..1)\n"
-            "- reason (one short sentence)\n"
-            "No markdown. No code fences. No extra text."
-        )
+        criteria_lines = criteria or []
+        if criteria_lines:
+            criteria_text = "Selection criteria (in order of importance):\n" + "\n".join(
+                f"  - {c}" for c in criteria_lines
+            )
+        else:
+            criteria_text = "Choose the single best deliverable frame based on sharpness, subject clarity, and strongest timing."
+
+        panel_modes = {label: item.get("_panel_mode", "full") for label, item in label_to_item.items()}
+        mode_values = set(panel_modes.values())
+        if "subject_crop" in mode_values:
+            crop_note = "Panels show a subject-crop view with a small full-frame inset in the corner."
+        elif "center_zoom" in mode_values:
+            crop_note = "Panels show a 2x zoomed centre view with a small full-frame inset in the corner."
+        else:
+            crop_note = ""
+
+        system_prompt_parts = [
+            "You are a sports burst-frame comparison assistant.\n",
+            "You will see one labeled comparison grid image with panels named Panel A, Panel B, Panel C, or Panel D.\n",
+        ]
+        if crop_note:
+            system_prompt_parts.append(f"{crop_note}\n")
+        system_prompt_parts += [
+            f"{criteria_text}\n",
+            "Do not use object detection metadata; judge only the visual frame quality.\n",
+            "Return EXACTLY one valid JSON object and nothing else.\n",
+            "Required JSON keys:\n",
+            "- winner_label (string, one of A/B/C/D that is present)\n",
+            "- runner_up_labels (array of zero or more labels from A/B/C/D that are present)\n",
+            "- confidence (number 0..1)\n",
+            "- reason (one short sentence)\n",
+            "- eyes_open (string: \"yes\", \"no\", \"partial\", or \"unknown\" — "
+            "state of the subject's eyes in the winning panel)\n",
+            "No markdown. No code fences. No extra text.",
+        ]
+        system_prompt = "".join(system_prompt_parts)
         user_prompt = (
             "Select the best panel label from this burst round grid.\n"
             "Valid options for this round:\n"
@@ -2958,6 +3224,10 @@ class AICullTool:
         except Exception:
             confidence = 0.0
 
+        eyes_open = str(parsed.get("eyes_open", "unknown")).strip().lower()
+        if eyes_open not in {"yes", "no", "partial", "unknown"}:
+            eyes_open = "unknown"
+
         winner_label = ""
         winner_path = str(winner["path"])
         for label, item in label_to_item.items():
@@ -2979,7 +3249,9 @@ class AICullTool:
             "runner_up_paths": runner_ups,
             "reason": str(parsed.get("reason", "")).strip(),
             "confidence": max(0.0, min(1.0, confidence)),
+            "eyes_open": eyes_open,
             "candidate_map": {label: str(item["path"]) for label, item in label_to_item.items()},
+            "panel_modes": panel_modes,
         }
 
     def _select_single_burst_winner_via_tournament(
@@ -2990,6 +3262,8 @@ class AICullTool:
         start_round: int,
         temperature: float,
         max_tokens: int,
+        criteria: list[str] | None = None,
+        group_seed: int = 0,
     ) -> tuple[dict | None, list[dict], int]:
         if not items:
             return None, [], start_round
@@ -2999,7 +3273,12 @@ class AICullTool:
         round_index = start_round
         round_meta: list[dict] = []
         cursor = 0
-        chunk = items[: min(self.VL_BURST_MAX_ROUND_IMAGES, len(items))]
+
+        # Shuffle panel order with a deterministic seed to mitigate Panel A bias.
+        rng = random.Random(group_seed ^ round_index)
+        chunk_src = items[: min(self.VL_BURST_MAX_ROUND_IMAGES, len(items))]
+        chunk = list(chunk_src)
+        rng.shuffle(chunk)
 
         winner, meta = self._run_burst_vl_round(
             client=client,
@@ -3008,28 +3287,126 @@ class AICullTool:
             round_index=round_index,
             temperature=temperature,
             max_tokens=max_tokens,
+            criteria=criteria,
         )
+
+        # Low-confidence double-check: re-run with reversed panel order.
+        if meta.get("confidence", 1.0) < self.VL_BURST_LOW_CONFIDENCE:
+            try:
+                reversed_chunk = list(reversed(chunk))
+                winner_rev, meta_rev = self._run_burst_vl_round(
+                    client=client,
+                    model=model,
+                    round_items=reversed_chunk,
+                    round_index=round_index,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    criteria=criteria,
+                )
+                if str(winner_rev.get("path", "")) == str(winner.get("path", "")):
+                    # Both runs agree — accept the original winner.
+                    meta["position_bias_confirmed"] = True
+                else:
+                    # Disagreement — fall back to best focus-ranked candidate from the chunk.
+                    meta["position_bias_disagreement"] = True
+                    meta_rev["position_bias_disagreement"] = True
+                    round_meta.append(meta)
+                    round_meta.append(meta_rev)
+                    cursor = len(chunk_src)
+                    round_index += 1
+                    # Focus fallback: pick highest burst_focus from the chunk candidates.
+                    winner = max(
+                        chunk_src,
+                        key=lambda x: float(x.get("burst_focus", x.get("hero_focus", 0.0))),
+                    )
+                    while cursor < len(items):
+                        opponents = items[cursor:cursor + self.VL_BURST_MAX_NEW_CHALLENGERS]
+                        if not opponents:
+                            break
+                        opp_shuffled = list(opponents)
+                        rng.shuffle(opp_shuffled)
+                        winner_next, meta_next, round_index = self._select_single_burst_winner_via_tournament(
+                            client=client,
+                            model=model,
+                            items=[winner] + opponents,
+                            start_round=round_index,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            criteria=criteria,
+                            group_seed=group_seed,
+                        )
+                        if winner_next is not None:
+                            winner = winner_next
+                        round_meta.extend(meta_next)
+                        cursor += len(opponents)
+                    return winner, round_meta, round_index
+            except Exception:
+                pass  # If double-check fails, proceed with original winner.
+
         round_meta.append(meta)
-        cursor = len(chunk)
+        cursor = len(chunk_src)
         round_index += 1
 
         while cursor < len(items):
             opponents = items[cursor:cursor + self.VL_BURST_MAX_NEW_CHALLENGERS]
             if not opponents:
                 break
-            winner, meta = self._run_burst_vl_round(
+            opp_shuffled = list(opponents)
+            rng.shuffle(opp_shuffled)
+            winner, meta, round_index = self._select_single_burst_winner_via_tournament(
                 client=client,
                 model=model,
-                round_items=[winner] + opponents,
-                round_index=round_index,
+                items=[winner] + opponents,
+                start_round=round_index,
                 temperature=temperature,
                 max_tokens=max_tokens,
-            )
-            round_meta.append(meta)
+                criteria=criteria,
+                group_seed=group_seed,
+            ) if len([winner] + opponents) > 1 else (winner, {}, round_index)
+            if isinstance(meta, dict):
+                round_meta.append(meta)
+            elif isinstance(meta, list):
+                round_meta.extend(meta)
             cursor += len(opponents)
-            round_index += 1
 
         return winner, round_meta, round_index
+
+    def _tournament_cache_key(
+        self,
+        burst_results: list[dict],
+        keep_per_burst: int,
+        model: str,
+        criteria: list[str],
+    ) -> str:
+        """Return a stable cache key for a burst tournament run."""
+        member_parts = []
+        for item in burst_results:
+            p = Path(item["path"])
+            try:
+                mtime = int(p.stat().st_mtime * 1000)
+            except Exception:
+                mtime = 0
+            member_parts.append(f"{p.name}:{mtime}")
+        member_parts.sort()
+        criteria_str = "|".join(sorted(criteria))
+        payload = f"{','.join(member_parts)}::keep={keep_per_burst}::model={model}::criteria={criteria_str}::schema={DANCE_CULL_SCHEMA_VERSION}"
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    def _load_tournament_cache(self, image_path: Path) -> dict:
+        try:
+            cache_path = self._dance_debug_dir(image_path) / "burst_tournament_cache.json"
+            if cache_path.exists():
+                return json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def _save_tournament_cache(self, image_path: Path, cache: dict) -> None:
+        try:
+            cache_path = self._dance_debug_dir(image_path) / "burst_tournament_cache.json"
+            cache_path.write_text(json.dumps(cache, indent=2, default=str), encoding="utf-8")
+        except Exception:
+            pass
 
     def _select_burst_winners_with_vl(
         self,
@@ -3041,14 +3418,35 @@ class AICullTool:
         if len(candidates) < 2:
             return None, {}
 
+        # Load winner criteria from config or fall back to defaults.
+        raw_criteria = config.get("winner_criteria", "")
+        criteria = normalize_winner_criteria_lines(raw_criteria if raw_criteria else None)
+
         try:
             base_url, model, timeout, temperature, max_tokens = self._dance_lmstudio_settings()
+
+            # --- Tournament result caching ---
+            cache_key = self._tournament_cache_key(candidates, keep_per_burst, model, criteria)
+            if candidates:
+                t_cache = self._load_tournament_cache(Path(candidates[0]["path"]))
+                if cache_key in t_cache:
+                    cached_result = t_cache[cache_key]
+                    self.app.log("AI Cull Burst: tournament result loaded from cache.")
+                    # Rebuild chosen list from cached selected paths.
+                    path_to_item = {str(item["path"]): item for item in burst_results}
+                    chosen = [path_to_item[p] for p in cached_result.get("selected_frames", []) if p in path_to_item]
+                    if chosen:
+                        return chosen[:keep_per_burst], dict(cached_result)
+
             client = LMStudioClient(base_url=base_url, timeout=timeout)
             remaining = list(candidates)
             chosen: list[dict] = []
             rounds: list[dict] = []
             round_index = 1
             keep_target = min(max(1, int(keep_per_burst)), len(remaining))
+
+            # Use a deterministic group seed from first path for reproducibility.
+            group_seed = hash(str(candidates[0].get("path", ""))) & 0xFFFFFF if candidates else 0
 
             while remaining and len(chosen) < keep_target:
                 if len(remaining) == 1:
@@ -3062,12 +3460,45 @@ class AICullTool:
                     start_round=round_index,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    criteria=criteria,
+                    group_seed=group_seed,
                 )
                 if winner is None:
                     return None, {"error": "VL burst tournament returned no winner.", "rounds": rounds}
                 chosen.append(winner)
                 rounds.extend(round_meta)
                 remaining = [item for item in remaining if item is not winner]
+
+                # Diversity filter: exclude near-duplicates of already-chosen winners
+                # (dHash distance <= DHASH_NEAR_DUPLICATE_THRESHOLD) unless that would
+                # leave fewer candidates than needed.
+                if len(chosen) < keep_target and remaining:
+                    excluded_as_dup: list[str] = []
+                    non_dup = []
+                    for candidate in remaining:
+                        is_dup = False
+                        try:
+                            img_cand = self._load_rgb_image(Path(candidate["path"]))
+                            h_cand = _burst_dhash(img_cand)
+                            for picked in chosen:
+                                img_pick = self._load_rgb_image(Path(picked["path"]))
+                                h_pick = _burst_dhash(img_pick)
+                                if _burst_hamming(h_cand, h_pick) <= DHASH_NEAR_DUPLICATE_THRESHOLD:
+                                    is_dup = True
+                                    break
+                        except Exception:
+                            pass
+                        if is_dup:
+                            excluded_as_dup.append(str(candidate["path"]))
+                        else:
+                            non_dup.append(candidate)
+                    # Only apply filter when enough non-duplicates remain.
+                    still_needed = keep_target - len(chosen)
+                    if len(non_dup) >= still_needed:
+                        remaining = non_dup
+                        if excluded_as_dup:
+                            rounds[-1:] and rounds[-1].update({"excluded_as_duplicates": excluded_as_dup})
+
         except Exception as exc:
             self.app.log(f"AI Cull: VL burst tie-breaker unavailable ({exc}); using heuristic ranking.")
             return None, {"error": str(exc)}
@@ -3088,8 +3519,17 @@ class AICullTool:
             "selection_mode": "vl_tournament_grid",
             "selected_frames": selected_paths,
             "rounds": rounds,
+            "confidence": max(0.0, min(1.0, avg_confidence)),
         }
-        meta["confidence"] = max(0.0, min(1.0, avg_confidence))
+
+        # Cache the tournament result for future runs.
+        try:
+            if candidates:
+                t_cache = self._load_tournament_cache(Path(candidates[0]["path"]))
+                t_cache[cache_key] = meta
+                self._save_tournament_cache(Path(candidates[0]["path"]), t_cache)
+        except Exception:
+            pass
 
         return chosen[:keep_per_burst], meta
 
@@ -3130,13 +3570,25 @@ class AICullTool:
                 pass
             self._worker_queue.put(("burst_group_start", group_idx, total_burst_groups, group_paths_str, preview_image))
 
-            burst_items = [{"path": str(p)} for p in group]
+            # Build bare items; compute focus scores now so the fallback path is sharpness-ranked.
+            burst_items: list[dict] = []
+            for p in group:
+                item: dict = {"path": str(p)}
+                try:
+                    img = self._load_rgb_image(p)
+                    item["burst_focus"] = _burst_focus(img)
+                except Exception:
+                    item["burst_focus"] = 0.0
+                burst_items.append(item)
+
             winners, vl_meta = self._select_burst_winners_with_vl(burst_items, keep_per_burst, vl_config)
 
             if winners:
                 winner_paths: list[Path] = [Path(w["path"]) for w in winners]
             else:
-                winner_paths = list(group[:max(1, keep_per_burst)])
+                # Focus-ranked fallback: pick the sharpest keep_per_burst frames.
+                sorted_by_focus = sorted(burst_items, key=lambda x: float(x.get("burst_focus", 0.0)), reverse=True)
+                winner_paths = [Path(x["path"]) for x in sorted_by_focus[:max(1, keep_per_burst)]]
 
             vl_winners[group_idx] = winner_paths
             vl_metas[group_idx] = vl_meta if vl_meta else {}
@@ -3232,9 +3684,30 @@ class AICullTool:
             vl_used = bool(vl_meta) and "error" not in vl_meta
             selector_tag = " (VL)" if vl_used else " (fallback)"
             winner_names = ", ".join(Path(p).name for p in winner_path_strings)
+
+            # Determine if this group has low VL confidence.
+            avg_confidence = float(vl_meta.get("confidence", 1.0)) if vl_meta else 1.0
+            low_confidence = vl_used and avg_confidence < self.VL_BURST_LOW_CONFIDENCE
+
             self.app.log(
                 f"AI Cull Burst: group {burst_group_progress}/{total_burst_groups} winner{selector_tag}: {winner_names}"
+                + (f" [low-confidence={avg_confidence:.2f}]" if low_confidence else "")
             )
+            if low_confidence:
+                try:
+                    self._log_manual_review_entry(
+                        group_paths[0],
+                        {
+                            "reason": "burst_low_confidence",
+                            "group_id": f"burst_{burst_index:04d}",
+                            "group_paths": group_paths_str,
+                            "winner_paths": winner_path_strings,
+                            "confidence": avg_confidence,
+                        },
+                    )
+                except Exception:
+                    pass
+
             grid_image = None
             if vl_meta and vl_meta.get("rounds"):
                 last_round = vl_meta["rounds"][-1]
@@ -3265,11 +3738,17 @@ class AICullTool:
                 item["burst_vl_selector_used"] = vl_used
                 item["burst_keep_target"] = keep_target
                 item["burst_conservative_scene_mode"] = has_static_group_pose
+                item["burst_low_confidence"] = low_confidence
                 if vl_meta:
                     item["burst_vl_selector"] = vl_meta
                 if Path(item["path"]) not in winner_paths:
-                    item["decision"] = "Reject"
                     item["burst_suppressed"] = True
+                    # Low-confidence groups: demote to Maybe instead of hard Reject
+                    # so the photographer can review borderline bursts manually.
+                    if low_confidence:
+                        item["decision"] = "Maybe"
+                    else:
+                        item["decision"] = "Reject"
                 else:
                     item["burst_suppressed"] = False
 

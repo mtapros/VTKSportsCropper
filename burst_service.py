@@ -5,7 +5,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 
 
 SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
@@ -20,6 +20,15 @@ DEFAULT_BURST_WINNER_CRITERIA = (
 DEFAULT_BURST_THUMBNAIL_SIZE = 288
 MIN_BURST_THUMBNAIL_SIZE = 120
 MAX_BURST_THUMBNAIL_SIZE = 768
+
+# Burst grouping / splitting constants
+MAX_BURST_GROUP_FRAMES: int = 20
+MAX_BURST_GROUP_SPAN_SEC: float = 5.0
+
+# dHash thresholds (64-bit hash, max distance = 64)
+DHASH_SCENE_CHANGE_THRESHOLD: int = 24   # above → likely scene change → force split
+DHASH_NEAR_DUPLICATE_THRESHOLD: int = 8  # below → near duplicate
+DHASH_GAP_MERGE_THRESHOLD: int = 10      # very similar → can merge across small gap
 
 
 @dataclass
@@ -118,6 +127,71 @@ def normalize_winner_criteria_lines(text: str | None, include_defaults: bool = T
     return normalized
 
 
+def dhash(image: Image.Image, hash_size: int = 8) -> int:
+    """Compute a 64-bit difference hash (dHash) for *image* using PIL only.
+
+    Resize the image to (hash_size+1) × hash_size grayscale pixels and compare
+    adjacent horizontal pixels to produce a *hash_size²*-bit integer.
+    """
+    img = image.convert("L").resize((hash_size + 1, hash_size), Image.LANCZOS)
+    pixels = list(img.getdata())
+    bits = 0
+    for row in range(hash_size):
+        for col in range(hash_size):
+            left = pixels[row * (hash_size + 1) + col]
+            right = pixels[row * (hash_size + 1) + col + 1]
+            bits = (bits << 1) | (1 if left > right else 0)
+    return bits
+
+
+def hamming_distance(hash_a: int, hash_b: int) -> int:
+    """Return the number of differing bits between two integer hashes."""
+    xor = hash_a ^ hash_b
+    count = 0
+    while xor:
+        count += xor & 1
+        xor >>= 1
+    return count
+
+
+def pil_laplacian_focus(image: Image.Image, bbox: tuple[int, int, int, int] | None = None) -> float:
+    """Estimate image sharpness via Laplacian edge-energy using PIL only.
+
+    Crops to *bbox* (x1, y1, x2, y2) when provided, then downsamples to at
+    most 256 px on the long edge before computing edge variance.  Returns a
+    non-negative float; higher = sharper.
+    """
+    try:
+        if bbox is not None:
+            x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(image.width, x2)
+            y2 = min(image.height, y2)
+            if x2 <= x1 or y2 <= y1:
+                return 0.0
+            image = image.crop((x1, y1, x2, y2))
+
+        # Downsample so variance computation is fast
+        max_edge = 256
+        w, h = image.size
+        if max(w, h) > max_edge:
+            scale = max_edge / float(max(w, h))
+            image = image.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+
+        gray = image.convert("L")
+        edges = gray.filter(ImageFilter.FIND_EDGES)
+        pixels = list(edges.getdata())
+        n = len(pixels)
+        if n == 0:
+            return 0.0
+        mean = sum(pixels) / n
+        variance = sum((p - mean) * (p - mean) for p in pixels) / n
+        return float(variance)
+    except Exception:
+        return 0.0
+
+
 def list_supported_images(folder: Path) -> list[Path]:
     folder = Path(folder)
     if not folder.exists() or not folder.is_dir():
@@ -143,6 +217,14 @@ def build_square_thumbnail(image_path: Path, side: int, background: tuple[int, i
 
 
 def extract_capture_timestamp(image_path: Path) -> tuple[float, str]:
+    """Return (unix_timestamp, precision_source) for *image_path*.
+
+    precision_source values:
+      "exif_subsec"  – EXIF datetime + subsecond fraction (37522 / 37523 / 37521)
+      "exif_whole"   – EXIF datetime only, 1-second resolution
+      "mtime"        – filesystem modification time
+      "none"         – could not determine
+    """
     path = Path(image_path)
     try:
         with Image.open(path) as img:
@@ -152,12 +234,15 @@ def extract_capture_timestamp(image_path: Path) -> tuple[float, str]:
             if dt_value:
                 dt = datetime.strptime(str(dt_value).strip(), "%Y:%m:%d %H:%M:%S")
                 frac = 0.0
-                subsec = exif.get(37521)
+                # Prefer SubSecTimeOriginal (37522), then SubSecTimeDigitized (37523),
+                # then SubSecTime (37521) as last resort.
+                subsec = exif.get(37522) or exif.get(37523) or exif.get(37521)
                 if subsec is not None:
                     digits = "".join(ch for ch in str(subsec) if ch.isdigit())
                     if digits:
                         frac = float(f"0.{digits}")
-                return dt.timestamp() + frac, "exif"
+                        return dt.timestamp() + frac, "exif_subsec"
+                return dt.timestamp(), "exif_whole"
     except Exception:
         pass
 
@@ -175,25 +260,78 @@ def group_adjacent_images(ordered_paths: list[Path], fps_threshold: float) -> li
     groups: list[list[Path]] = []
     current: list[Path] = []
     previous_ts: float | None = None
+    previous_source: str | None = None
+    previous_path: Path | None = None
 
     for path in ordered_paths:
-        ts, _ = extract_capture_timestamp(Path(path))
+        path = Path(path)
+        ts, source = extract_capture_timestamp(path)
         if not current:
-            current = [Path(path)]
+            current = [path]
             previous_ts = ts
+            previous_source = source
+            previous_path = path
             continue
 
         delta = ts - float(previous_ts or 0.0)
-        if 0.0 <= delta <= threshold_sec:
-            current.append(Path(path))
+        same_burst = False
+        if delta >= 0:
+            if source == "mtime" and previous_source == "mtime" and delta == 0:
+                # Identical mtimes — use filename sequencing to avoid false merges.
+                same_burst = _looks_like_sequential_burst_names(previous_path, path)
+            elif source == "exif_whole" and previous_source == "exif_whole" and 0 <= delta <= 1.0:
+                # Whole-second EXIF: a 1-second boundary gap is ambiguous — corroborate with names.
+                same_burst = _looks_like_sequential_burst_names(previous_path, path)
+            else:
+                same_burst = delta <= threshold_sec
+
+        if same_burst:
+            current.append(path)
         else:
             groups.append(current)
-            current = [Path(path)]
+            current = [path]
+
         previous_ts = ts
+        previous_source = source
+        previous_path = path
 
     if current:
         groups.append(current)
     return groups
+
+
+def _looks_like_sequential_burst_names(previous_path: Path | None, current_path: Path) -> bool:
+    """Return True when *current_path* appears to be a sequential continuation of *previous_path*."""
+    if previous_path is None:
+        return False
+    prev_stem = previous_path.stem
+    curr_stem = current_path.stem
+
+    prev_digits = ""
+    i = len(prev_stem) - 1
+    while i >= 0 and prev_stem[i].isdigit():
+        prev_digits = prev_stem[i] + prev_digits
+        i -= 1
+
+    curr_digits = ""
+    j = len(curr_stem) - 1
+    while j >= 0 and curr_stem[j].isdigit():
+        curr_digits = curr_stem[j] + curr_digits
+        j -= 1
+
+    if not prev_digits or not curr_digits:
+        return False
+
+    prev_prefix = prev_stem[: len(prev_stem) - len(prev_digits)]
+    curr_prefix = curr_stem[: len(curr_stem) - len(curr_digits)]
+    if prev_prefix != curr_prefix:
+        return False
+
+    try:
+        delta = int(curr_digits) - int(prev_digits)
+    except Exception:
+        return False
+    return 0 < delta <= 3
 
 
 def analyze_bursts(folder: Path, fps_threshold: float) -> BurstAnalysis:
