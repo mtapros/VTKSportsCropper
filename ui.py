@@ -291,7 +291,7 @@ class MainWindow:
             "Burst Detection Tool": "Standalone timestamp burst analysis and VL winner selection",
             "Cached Crop Tool": "Cache-driven crop preview with nested ratio guides and batch commit",
             "Full Trial Pipeline": "Automated cull-to-crop batch run with live visual progress",
-            "LM Studio Test": "LM Studio local model test and vision prompt debugging",
+            "AI Model Settings": "Local (LM Studio) and API (OpenAI, Anthropic, Gemini) model settings and testing",
         }
 
         banner_colors = {
@@ -301,7 +301,7 @@ class MainWindow:
             "Burst Detection Tool": ("#234e52", "#d7f6f8"),
             "Cached Crop Tool": ("#5a3a1a", "#ffe8cf"),
             "Full Trial Pipeline": ("#1f5c42", "#d8ffef"),
-            "LM Studio Test": ("#3f2a56", "#eadbff"),
+            "AI Model Settings": ("#3f2a56", "#eadbff"),
         }
 
         subtitle = subtitles.get(display_name, "")

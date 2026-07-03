@@ -7,22 +7,26 @@ from tkinter import simpledialog
 from tkinter import ttk
 
 from lmstudio_client import LMStudioClient
+from vision_provider import PROVIDERS, create_vision_client, normalize_provider
 
 
 class LMStudioTool:
     tool_id = "lmstudio"
-    display_name = "LM Studio Test"
-    SETTINGS_WINDOW_GEOMETRY = "560x520"
+    display_name = "AI Model Settings"
+    SETTINGS_WINDOW_GEOMETRY = "560x640"
 
     def __init__(self, app):
         self.app = app
         self.panel = None
 
+        self.provider_var = tk.StringVar(value="lmstudio")
         self.base_url_var = tk.StringVar(value="http://127.0.0.1:1234/v1")
         self.model_var = tk.StringVar(value="")
+        self.api_key_var = tk.StringVar(value="")
         self.timeout_var = tk.StringVar(value="60")
         self.temperature_var = tk.StringVar(value="0.2")
         self.max_tokens_var = tk.StringVar(value="512")
+        self.max_workers_var = tk.StringVar(value="1")
 
         self.system_prompt_var = tk.StringVar(value="You are a concise local assistant.")
         self.user_prompt_var = tk.StringVar(value="Reply with: LM Studio test successful.")
@@ -39,6 +43,7 @@ class LMStudioTool:
         )
 
         self.model_combo = None
+        self.provider_combo = None
         self.response_box = None
 
         self.good_criteria_box = None
@@ -56,20 +61,26 @@ class LMStudioTool:
 
     def _default_settings(self) -> dict:
         return {
+            "provider": "lmstudio",
             "base_url": "http://127.0.0.1:1234/v1",
             "model": "",
+            "api_key": "",
             "timeout": "60",
             "temperature": "0.2",
             "max_tokens": "512",
+            "max_workers": "1",
         }
 
     def _collect_settings(self) -> dict:
         return {
+            "provider": normalize_provider(self.provider_var.get()),
             "base_url": self.base_url_var.get().strip(),
             "model": self.model_var.get().strip(),
+            "api_key": self.api_key_var.get().strip(),
             "timeout": self.timeout_var.get().strip() or "60",
             "temperature": self.temperature_var.get().strip() or "0.2",
             "max_tokens": self.max_tokens_var.get().strip() or "512",
+            "max_workers": self.max_workers_var.get().strip() or "1",
         }
 
     def _apply_settings(self, settings: dict):
@@ -79,11 +90,14 @@ class LMStudioTool:
             for key in defaults:
                 value = settings.get(key, defaults[key])
                 merged[key] = str(value) if value is not None else defaults[key]
+        self.provider_var.set(normalize_provider(merged["provider"]))
         self.base_url_var.set(merged["base_url"])
         self.model_var.set(merged["model"])
+        self.api_key_var.set(merged["api_key"])
         self.timeout_var.set(merged["timeout"])
         self.temperature_var.set(merged["temperature"])
         self.max_tokens_var.set(merged["max_tokens"])
+        self.max_workers_var.set(merged["max_workers"])
 
     def _load_presets_file(self):
         defaults = self._default_settings()
@@ -102,11 +116,14 @@ class LMStudioTool:
                             if not isinstance(entry, dict):
                                 continue
                             parsed[str(name)] = {
+                                "provider": normalize_provider(entry.get("provider", defaults["provider"])),
                                 "base_url": str(entry.get("base_url", defaults["base_url"])),
                                 "model": str(entry.get("model", defaults["model"])),
+                                "api_key": str(entry.get("api_key", defaults["api_key"])),
                                 "timeout": str(entry.get("timeout", defaults["timeout"])),
                                 "temperature": str(entry.get("temperature", defaults["temperature"])),
                                 "max_tokens": str(entry.get("max_tokens", defaults["max_tokens"])),
+                                "max_workers": str(entry.get("max_workers", defaults["max_workers"])),
                             }
                         if parsed:
                             loaded_presets = parsed
@@ -201,8 +218,27 @@ class LMStudioTool:
         tk.Button(preset_row, text="Save As", command=self._save_preset_as).pack(side=tk.LEFT)
         self._refresh_preset_controls()
 
-        tk.Label(parent, text="Server URL", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+        tk.Label(parent, text="Provider", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+        provider_ids = list(PROVIDERS.keys())
+        self.provider_combo = ttk.Combobox(
+            parent,
+            textvariable=self.provider_var,
+            values=provider_ids,
+            state="readonly",
+        )
+        self.provider_combo.pack(fill="x", **pad)
+        self.provider_combo.bind("<<ComboboxSelected>>", self._on_provider_selected)
+
+        tk.Label(parent, text="Server URL (blank = provider default)", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
         tk.Entry(parent, textvariable=self.base_url_var).pack(fill="x", **pad)
+
+        tk.Label(
+            parent,
+            text="API Key (literal, env:VAR_NAME, or blank for default env var)",
+            bg="#2a2a2a",
+            fg="white",
+        ).pack(anchor="w", **pad)
+        tk.Entry(parent, textvariable=self.api_key_var, show="*").pack(fill="x", **pad)
 
         tk.Label(parent, text="Model", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
         self.model_combo = ttk.Combobox(parent, textvariable=self.model_var, values=[], state="normal")
@@ -217,6 +253,9 @@ class LMStudioTool:
         tk.Label(parent, text="Max Tokens", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
         tk.Entry(parent, textvariable=self.max_tokens_var).pack(fill="x", **pad)
 
+        tk.Label(parent, text="Parallel Requests (1 = sequential; raise for API providers)", bg="#2a2a2a", fg="white").pack(anchor="w", **pad)
+        tk.Entry(parent, textvariable=self.max_workers_var).pack(fill="x", **pad)
+
         tk.Button(parent, text="Test Connection", command=self.test_connection).pack(fill="x", padx=10, pady=(10, 4))
         tk.Button(parent, text="Refresh Models", command=self.refresh_models).pack(fill="x", padx=10, pady=4)
 
@@ -228,7 +267,7 @@ class LMStudioTool:
             return
 
         self.settings_window = tk.Toplevel(self.app.root)
-        self.settings_window.title("LM Studio Settings")
+        self.settings_window.title("AI Model Settings")
         self.settings_window.geometry(self.SETTINGS_WINDOW_GEOMETRY)
         self.settings_window.configure(bg="#2a2a2a")
 
@@ -250,7 +289,7 @@ class LMStudioTool:
 
         tk.Label(
             self.panel,
-            text="LM Studio Test",
+            text="AI Model Settings & Test",
             bg="#2a2a2a",
             fg="white",
             font=("Arial", 11, "bold"),
@@ -387,12 +426,36 @@ class LMStudioTool:
     def on_image_changed(self):
         pass
 
+    def _on_provider_selected(self, event=None):
+        provider = normalize_provider(self.provider_var.get())
+        spec = PROVIDERS.get(provider, {})
+        current_url = self.base_url_var.get().strip()
+        known_defaults = {str(p.get("default_base_url", "")) for p in PROVIDERS.values()}
+        if not current_url or current_url in known_defaults:
+            self.base_url_var.set(str(spec.get("default_base_url", "")))
+
     def _client(self) -> LMStudioClient:
         try:
             timeout = float(self.timeout_var.get().strip() or "60")
         except Exception:
             timeout = 60.0
-        return LMStudioClient(self.base_url_var.get().strip(), timeout=timeout)
+        return create_vision_client(
+            provider=self.provider_var.get(),
+            base_url=self.base_url_var.get().strip(),
+            timeout=timeout,
+            api_key=self.api_key_var.get().strip(),
+        )
+
+    def create_client(self) -> LMStudioClient:
+        """Public factory used by other tools (AI Cull, Burst Detection…)."""
+        return self._client()
+
+    def get_max_workers(self) -> int:
+        try:
+            value = int(self.max_workers_var.get().strip() or "1")
+        except Exception:
+            value = 1
+        return max(1, min(16, value))
 
     def _temperature(self) -> float:
         try:

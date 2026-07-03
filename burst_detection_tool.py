@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import tkinter as tk
 from tkinter import filedialog
@@ -1101,16 +1102,13 @@ class BurstDetectionTool:
     def _lmstudio_settings(self) -> tuple[str, str, float, float, int] | None:
         tool = self.app.tools_by_id.get("lmstudio")
         if tool is None:
-            self.app.log("Burst Detection: LM Studio tool is unavailable.")
+            self.app.log("Burst Detection: AI model settings tool is unavailable.")
             return None
 
         base_url = tool.base_url_var.get().strip()
         model = tool.model_var.get().strip()
-        if not base_url:
-            self.app.log("Burst Detection: LM Studio base URL is empty.")
-            return None
         if not model:
-            self.app.log("Burst Detection: choose an LM Studio model first.")
+            self.app.log("Burst Detection: choose an AI model first.")
             return None
 
         try:
@@ -1150,36 +1148,52 @@ class BurstDetectionTool:
 
         self.app.log(f"Burst Detection: running VL tournament for {len(row_indices)} row(s).")
 
+        settings_tool = self.app.tools_by_id.get("lmstudio")
+        try:
+            max_workers = int(settings_tool.get_max_workers()) if settings_tool is not None else 1
+        except Exception:
+            max_workers = 1
+
+        def process_row(row_index: int) -> None:
+            client = settings_tool.create_client()
+            row = self.rows[row_index]
+            frame_paths = [Path(p) for p in row["paths"]]
+            self._log_async(
+                f"Burst Detection: VL row {row_index + 1} started with {len(frame_paths)} candidate(s): "
+                f"{', '.join(path.name for path in frame_paths)}"
+            )
+            try:
+                winners, meta = self._select_burst_winners_with_vl(
+                    client=client,
+                    model=model,
+                    frame_paths=frame_paths,
+                    keep_per_burst=keep_per_burst,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    criteria_lines=criteria_lines,
+                    row_index=row_index,
+                )
+            except Exception as exc:
+                self._log_async(f"Burst Detection: VL failed for row {row_index + 1} ({exc}).")
+                return
+
+            if not winners:
+                self._log_async(f"Burst Detection: VL row {row_index + 1} returned no valid winner.")
+                return
+
+            self.app.root.after(0, lambda idx=row_index, wp=winners, meta=meta: self._apply_vl_winners(idx, wp, meta))
+
         def worker():
             try:
-                client = LMStudioClient(base_url=base_url, timeout=timeout)
-                for row_index in row_indices:
-                    row = self.rows[row_index]
-                    frame_paths = [Path(p) for p in row["paths"]]
+                if max_workers > 1 and len(row_indices) > 1:
                     self._log_async(
-                        f"Burst Detection: VL row {row_index + 1} started with {len(frame_paths)} candidate(s): "
-                        f"{', '.join(path.name for path in frame_paths)}"
+                        f"Burst Detection: evaluating {len(row_indices)} row(s) with {max_workers} parallel tournament(s)."
                     )
-                    try:
-                        winners, meta = self._select_burst_winners_with_vl(
-                            client=client,
-                            model=model,
-                            frame_paths=frame_paths,
-                            keep_per_burst=keep_per_burst,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            criteria_lines=criteria_lines,
-                            row_index=row_index,
-                        )
-                    except Exception as exc:
-                        self._log_async(f"Burst Detection: VL failed for row {row_index + 1} ({exc}).")
-                        continue
-
-                    if not winners:
-                        self._log_async(f"Burst Detection: VL row {row_index + 1} returned no valid winner.")
-                        continue
-
-                    self.app.root.after(0, lambda idx=row_index, wp=winners, meta=meta: self._apply_vl_winners(idx, wp, meta))
+                    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="vl-burst-row") as executor:
+                        list(executor.map(process_row, row_indices))
+                else:
+                    for row_index in row_indices:
+                        process_row(row_index)
             finally:
                 self.app.root.after(0, self._finish_vl_run)
 

@@ -14,13 +14,22 @@ class LMStudioClient:
     COMPOSITION_PRESERVE_SCENE_TYPES = {"intro_pose", "finale_pose", "group_static_pose"}
     MAX_RAW_RESPONSE_EXCERPT = 700
 
-    def __init__(self, base_url: str, timeout: float = 60.0):
+    def __init__(self, base_url: str, timeout: float = 60.0, api_key: str = ""):
         self.base_url = base_url.strip().rstrip("/")
         self.timeout = float(timeout)
+        self.api_key = (api_key or "").strip()
 
-    def _http_get_json(self, path: str) -> dict:
+    def _auth_headers(self) -> dict:
+        if self.api_key:
+            return {"Authorization": "Bearer " + self.api_key}
+        return {}
+
+    def _http_get_json(self, path: str, headers: dict | None = None) -> dict:
         url = f"{self.base_url}{path}"
-        req = request.Request(url, method="GET")
+        merged_headers = dict(self._auth_headers())
+        if headers:
+            merged_headers.update(headers)
+        req = request.Request(url, headers=merged_headers, method="GET")
         try:
             with request.urlopen(req, timeout=self.timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
@@ -28,13 +37,17 @@ class LMStudioClient:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"HTTP {exc.code} GET {path} failed: {body}") from exc
 
-    def _http_post_json(self, path: str, payload: dict) -> dict:
+    def _http_post_json(self, path: str, payload: dict, headers: dict | None = None) -> dict:
         url = f"{self.base_url}{path}"
         body = json.dumps(payload).encode("utf-8")
+        merged_headers = {"Content-Type": "application/json"}
+        merged_headers.update(self._auth_headers())
+        if headers:
+            merged_headers.update(headers)
         req = request.Request(
             url,
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers=merged_headers,
             method="POST",
         )
         try:
@@ -75,10 +88,7 @@ class LMStudioClient:
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        choices = data.get("choices", [])
-        if not choices:
-            return ""
-        return choices[0].get("message", {}).get("content", "")
+        return self._chat_response_text(data)
 
     def _image_file_to_data_url(
         self,
@@ -105,50 +115,11 @@ class LMStudioClient:
 
         return f"data:image/jpeg;base64,{encoded}"
 
-    def vision_chat_text(
-        self,
-        model: str,
-        image_path: str | Path,
-        user_prompt: str,
-        system_prompt: str = "You are a concise sports photography vision assistant.",
-        temperature: float = 0.2,
-        max_tokens: int = 512,
-    ) -> str:
-        data_url = self._image_file_to_data_url(image_path)
-
-        payload = {
-            "model": model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": user_prompt,
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": data_url,
-                            },
-                        },
-                    ],
-                },
-            ],
-            "temperature": float(temperature),
-            "max_tokens": int(max_tokens),
-            "stream": False,
-        }
-
-        data = self._http_post_json("/chat/completions", payload)
+    @staticmethod
+    def _chat_response_text(data: dict) -> str:
         choices = data.get("choices", [])
         if not choices:
             return ""
-
         message = choices[0].get("message", {})
         content = message.get("content", "")
         if isinstance(content, str):
@@ -160,6 +131,47 @@ class LMStudioClient:
                     parts.append(item.get("text", ""))
             return "\n".join(p for p in parts if p)
         return json.dumps(content, indent=2)
+
+    def vision_chat_text(
+        self,
+        model: str,
+        image_path: str | Path,
+        user_prompt: str,
+        system_prompt: str = "You are a concise sports photography vision assistant.",
+        temperature: float = 0.2,
+        max_tokens: int = 512,
+    ) -> str:
+        data_url = self._image_file_to_data_url(image_path)
+
+        messages = [
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": user_prompt,
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": data_url,
+                        },
+                    },
+                ],
+            },
+        ]
+
+        data = self.chat(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return self._chat_response_text(data)
 
     def vision_chat_text_multi(
         self,
@@ -183,39 +195,24 @@ class LMStudioClient:
                 }
             )
 
-        payload = {
-            "model": model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": content,
-                },
-            ],
-            "temperature": float(temperature),
-            "max_tokens": int(max_tokens),
-            "stream": False,
-        }
+        messages = [
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": content,
+            },
+        ]
 
-        data = self._http_post_json("/chat/completions", payload)
-        choices = data.get("choices", [])
-        if not choices:
-            return ""
-
-        message = choices[0].get("message", {})
-        response_content = message.get("content", "")
-        if isinstance(response_content, str):
-            return response_content
-        if isinstance(response_content, list):
-            parts = []
-            for item in response_content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    parts.append(item.get("text", ""))
-            return "\n".join(p for p in parts if p)
-        return json.dumps(response_content, indent=2)
+        data = self.chat(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return self._chat_response_text(data)
 
     def _strip_markdown_code_fences(self, text: str) -> tuple[str, list[str]]:
         raw = text or ""

@@ -7,6 +7,7 @@ import math
 import queue
 import shutil
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 import tkinter as tk
@@ -651,7 +652,7 @@ class AICullTool:
             fg="white",
             selectcolor="#444",
         ).pack(anchor="w", **pad)
-        tk.Button(win, text="LM Studio Settings…", command=self.open_lmstudio_settings_window).pack(fill="x", padx=10, pady=(8, 4))
+        tk.Button(win, text="AI Model Settings…", command=self.open_lmstudio_settings_window).pack(fill="x", padx=10, pady=(8, 4))
         self._update_vision_warning()
         if self.vision_warning_var.get().strip():
             tk.Label(
@@ -1226,9 +1227,12 @@ class AICullTool:
         try:
             tool = self.app.tools_by_id.get("lmstudio")
             model = tool.model_var.get().strip() if tool else ""
+            provider = tool.provider_var.get().strip() if tool is not None and hasattr(tool, "provider_var") else ""
         except Exception:
             model = ""
-        raw = f"{DANCE_CULL_SCHEMA_VERSION}|{model}|vl1024|bigbadges|fullbatchflow"
+            provider = ""
+        provider_tag = "" if provider in ("", "lmstudio") else f"{provider}|"
+        raw = f"{DANCE_CULL_SCHEMA_VERSION}|{provider_tag}{model}|vl1024|bigbadges|fullbatchflow"
         return hashlib.md5(raw.encode()).hexdigest()[:12]
 
     def _get_dance_cull_cache(self, image_path: Path) -> DanceCullCache:
@@ -1648,14 +1652,12 @@ class AICullTool:
     def _dance_lmstudio_settings(self) -> tuple[str, str, float, float, int]:
         tool = self.app.tools_by_id.get("lmstudio")
         if tool is None:
-            raise RuntimeError("LM Studio tool is not loaded.")
+            raise RuntimeError("AI model settings tool is not loaded.")
 
         base_url = tool.base_url_var.get().strip()
         model = tool.model_var.get().strip()
-        if not base_url:
-            raise RuntimeError("LM Studio base URL is empty.")
         if not model:
-            raise RuntimeError("No LM Studio model selected.")
+            raise RuntimeError("No AI model selected.")
 
         try:
             timeout = float(tool.timeout_var.get().strip() or "60")
@@ -1673,6 +1675,21 @@ class AICullTool:
             max_tokens = 700
 
         return base_url, model, timeout, temperature, max_tokens
+
+    def _dance_vision_client(self) -> LMStudioClient:
+        tool = self.app.tools_by_id.get("lmstudio")
+        if tool is None:
+            raise RuntimeError("AI model settings tool is not loaded.")
+        return tool.create_client()
+
+    def _dance_max_workers(self) -> int:
+        tool = self.app.tools_by_id.get("lmstudio")
+        if tool is None:
+            return 1
+        try:
+            return int(tool.get_max_workers())
+        except Exception:
+            return 1
 
     def _default_scene_classification(self) -> dict:
         return {
@@ -1732,7 +1749,7 @@ class AICullTool:
 
     def _classify_scene_with_vl(self, image_path: Path) -> dict:
         base_url, model, timeout, temperature, max_tokens = self._dance_lmstudio_settings()
-        client = LMStudioClient(base_url=base_url, timeout=timeout)
+        client = self._dance_vision_client()
         scene = client.classify_scene_type(
             model=model,
             image_path=image_path,
@@ -2157,7 +2174,7 @@ class AICullTool:
             return None, "no detections"
 
         base_url, model, timeout, temperature, max_tokens = self._dance_lmstudio_settings()
-        client = LMStudioClient(base_url=base_url, timeout=timeout)
+        client = self._dance_vision_client()
 
         debug_path, det_to_color, color_to_det = self._draw_shaded_candidate_image(image_path, detections)
         self.current_vl_debug_image_path = debug_path
@@ -2296,7 +2313,7 @@ class AICullTool:
 
     def _evaluate_dance_with_vl(self, image_path: Path) -> dict:
         base_url, model, timeout, temperature, max_tokens = self._dance_lmstudio_settings()
-        client = LMStudioClient(base_url=base_url, timeout=timeout)
+        client = self._dance_vision_client()
         profile = self.get_profile_data()
         rubric_name = getattr(profile, "vl_rubric_name", "generic")
         if hasattr(client, "generic_cull_rubric"):
@@ -2409,7 +2426,13 @@ class AICullTool:
 
             if progress_callback is not None:
                 progress_callback("running vision rubric")
-            result = self._evaluate_dance_with_vl(Path(image_path))
+            result = None
+            prefetch = config.get("_vl_prefetch") or {}
+            prefetch_future = prefetch.get(str(Path(image_path).resolve()))
+            if prefetch_future is not None:
+                result = prefetch_future.result()
+            if result is None:
+                result = self._evaluate_dance_with_vl(Path(image_path))
             final_score = float(result["score"]) + crop_center_penalty
             final_decision = str(result["decision"])
 
@@ -3043,7 +3066,7 @@ class AICullTool:
 
         try:
             base_url, model, timeout, temperature, max_tokens = self._dance_lmstudio_settings()
-            client = LMStudioClient(base_url=base_url, timeout=timeout)
+            client = self._dance_vision_client()
             remaining = list(candidates)
             chosen: list[dict] = []
             rounds: list[dict] = []
@@ -3093,31 +3116,16 @@ class AICullTool:
 
         return chosen[:keep_per_burst], meta
 
-    def _run_vl_burst_evaluation(
+    def _run_vl_burst_groups_sequential(
         self,
-        paths: list[Path],
-        fps: float,
+        burst_groups: list[list[Path]],
+        total_burst_groups: int,
         keep_per_burst: int,
-    ) -> tuple[dict, list[list[Path]], set[str], list[Path], dict, dict]:
-        """Detect burst groups and select winners via VL tournament, reporting progress via the worker queue.
-
-        Returns (summary, burst_groups, removed_paths, remaining_paths, vl_winners, vl_metas).
-        vl_winners maps 1-based group index -> list[Path] of selected winner paths.
-        vl_metas  maps 1-based group index -> VL metadata dict for that group.
-        """
-        groups = self._build_bursts(paths, fps)
-        burst_groups = [g for g in groups if len(g) > 1]
-        total_burst_groups = len(burst_groups)
-
-        self._worker_queue.put(("burst_scan_started", total_burst_groups))
-
-        vl_winners: dict[int, list[Path]] = {}
-        vl_metas: dict[int, dict] = {}
-        removed_paths: set[str] = set()
-        # _select_burst_winners_with_vl guards on config["use_vl_burst_tiebreaker"], so we must
-        # pass this explicitly even though the calling context already established VL usage.
-        vl_config = {"use_vl_burst_tiebreaker": True}
-
+        vl_config: dict,
+        vl_winners: dict[int, list[Path]],
+        vl_metas: dict[int, dict],
+        removed_paths: set[str],
+    ) -> None:
         for group_idx, group in enumerate(burst_groups, start=1):
             if self._cancel_event.is_set():
                 break
@@ -3163,6 +3171,80 @@ class AICullTool:
                 vl_meta,
                 grid_image,
             ))
+
+    def _run_vl_burst_evaluation(
+        self,
+        paths: list[Path],
+        fps: float,
+        keep_per_burst: int,
+    ) -> tuple[dict, list[list[Path]], set[str], list[Path], dict, dict]:
+        """Detect burst groups and select winners via VL tournament, reporting progress via the worker queue.
+
+        Returns (summary, burst_groups, removed_paths, remaining_paths, vl_winners, vl_metas).
+        vl_winners maps 1-based group index -> list[Path] of selected winner paths.
+        vl_metas  maps 1-based group index -> VL metadata dict for that group.
+        """
+        groups = self._build_bursts(paths, fps)
+        burst_groups = [g for g in groups if len(g) > 1]
+        total_burst_groups = len(burst_groups)
+
+        self._worker_queue.put(("burst_scan_started", total_burst_groups))
+
+        vl_winners: dict[int, list[Path]] = {}
+        vl_metas: dict[int, dict] = {}
+        removed_paths: set[str] = set()
+        # _select_burst_winners_with_vl guards on config["use_vl_burst_tiebreaker"], so we must
+        # pass this explicitly even though the calling context already established VL usage.
+        vl_config = {"use_vl_burst_tiebreaker": True}
+
+        max_workers = self._dance_max_workers()
+        if max_workers > 1 and total_burst_groups > 1:
+            def process_group(args: tuple[int, list[Path]]) -> tuple[int, list[Path], dict]:
+                group_idx, group = args
+                if self._cancel_event.is_set():
+                    return group_idx, list(group[:max(1, keep_per_burst)]), {"error": "cancelled"}
+                group_paths_str = [str(p) for p in group]
+                self._worker_queue.put(("burst_group_start", group_idx, total_burst_groups, group_paths_str, None))
+                burst_items = [{"path": str(p)} for p in group]
+                winners, vl_meta = self._select_burst_winners_with_vl(burst_items, keep_per_burst, vl_config)
+                if winners:
+                    winner_paths = [Path(w["path"]) for w in winners]
+                else:
+                    winner_paths = list(group[:max(1, keep_per_burst)])
+                self._worker_queue.put((
+                    "burst_group_done",
+                    group_idx,
+                    total_burst_groups,
+                    [str(p) for p in winner_paths],
+                    vl_meta,
+                    None,
+                ))
+                return group_idx, winner_paths, (vl_meta if vl_meta else {})
+
+            self.app.log(
+                f"AI Cull Burst: evaluating {total_burst_groups} group(s) with {max_workers} parallel tournament(s)."
+            )
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="vl-burst") as executor:
+                for group_idx, winner_paths, vl_meta in executor.map(
+                    process_group, list(enumerate(burst_groups, start=1))
+                ):
+                    group = burst_groups[group_idx - 1]
+                    vl_winners[group_idx] = winner_paths
+                    vl_metas[group_idx] = vl_meta
+                    winner_set = {str(Path(p).resolve()) for p in winner_paths}
+                    for p in group:
+                        if str(Path(p).resolve()) not in winner_set:
+                            removed_paths.add(str(Path(p).resolve()))
+        else:
+            self._run_vl_burst_groups_sequential(
+                burst_groups,
+                total_burst_groups,
+                keep_per_burst,
+                vl_config,
+                vl_winners,
+                vl_metas,
+                removed_paths,
+            )
 
         burst_images = sum(len(g) for g in burst_groups)
         remaining_paths = [p for p in paths if str(Path(p).resolve()) not in removed_paths]
@@ -3855,20 +3937,34 @@ class AICullTool:
 
         total = len(paths)
 
-        def worker():
-            for idx, image_path in enumerate(paths, start=1):
-                if self._cancel_event.is_set():
-                    self._worker_queue.put(("done", idx - 1, True, total))
-                    return
-                try:
-                    def progress_callback(stage_message: str):
-                        self._worker_queue.put(("status", Path(image_path), stage_message, idx, total))
+        prefetch_executor: ThreadPoolExecutor | None = None
+        max_workers = self._dance_max_workers()
+        if bool(config.get("use_dance_vl", False)) and max_workers > 1 and total > 1:
+            prefetch_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="vl-prefetch")
+            config["_vl_prefetch"] = {
+                str(Path(p).resolve()): prefetch_executor.submit(self._evaluate_dance_with_vl, Path(p))
+                for p in paths
+            }
+            self.app.log(f"AI Cull: prefetching vision rubrics with {max_workers} parallel request(s).")
 
-                    result = self.evaluate_image_for_pipeline(Path(image_path), config, progress_callback=progress_callback)
-                    self._worker_queue.put(("result", Path(image_path), result, idx, total))
-                except Exception as exc:
-                    self._worker_queue.put(("error", Path(image_path), str(exc), idx, total))
-            self._worker_queue.put(("done", total, False, total))
+        def worker():
+            try:
+                for idx, image_path in enumerate(paths, start=1):
+                    if self._cancel_event.is_set():
+                        self._worker_queue.put(("done", idx - 1, True, total))
+                        return
+                    try:
+                        def progress_callback(stage_message: str):
+                            self._worker_queue.put(("status", Path(image_path), stage_message, idx, total))
+
+                        result = self.evaluate_image_for_pipeline(Path(image_path), config, progress_callback=progress_callback)
+                        self._worker_queue.put(("result", Path(image_path), result, idx, total))
+                    except Exception as exc:
+                        self._worker_queue.put(("error", Path(image_path), str(exc), idx, total))
+                self._worker_queue.put(("done", total, False, total))
+            finally:
+                if prefetch_executor is not None:
+                    prefetch_executor.shutdown(wait=False, cancel_futures=True)
 
         self._worker_thread = threading.Thread(target=worker, daemon=True)
         self._worker_thread.start()

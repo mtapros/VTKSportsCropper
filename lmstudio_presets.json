@@ -6,14 +6,20 @@
       "model": "",
       "timeout": "60",
       "temperature": "0.2",
-      "max_tokens": "512"
+      "max_tokens": "512",
+      "provider": "lmstudio",
+      "api_key": "",
+      "max_workers": "1"
     },
     "ai-one": {
       "base_url": "http://192.168.34.249:1234/v1",
       "model": "qwen/qwen3.5/huihui-qwen3.6-35b-a3b-abliterated-q4_k_m.gguf",
       "timeout": "60",
       "temperature": "0.2",
-      "max_tokens": "512"
+      "max_tokens": "512",
+      "provider": "lmstudio",
+      "api_key": "",
+      "max_workers": "1"
     }
   }
 }
